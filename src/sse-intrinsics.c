@@ -63,49 +63,177 @@ _inline __m128i _mm_set1_epi64x(long long a)
 #define MD5_SSE_NUM_KEYS	(SIMD_COEF_32*SIMD_PARA_MD5)
 #define MD5_PARA_DO(x)  for((x)=0;(x)<SIMD_PARA_MD5;(x)++)
 
-#define MD5_F(x,y,z)                                        \
-    MD5_PARA_DO(i) tmp[i] = vcmov((y[i]),(z[i]),(x[i]));
+#define MD5_F(x,y,z,i)	\
+    tmp1_##i = vcmov((y[i]),(z[i]),(x[i]));
 
-#define MD5_G(x,y,z)                                        \
-    MD5_PARA_DO(i) tmp[i] = vcmov((x[i]),(y[i]),(z[i]));
+#define MD5_G(x,y,z,i)	\
+    tmp1_##i = vcmov((x[i]),(y[i]),(z[i]));
 
 #if 1
-#define MD5_H(x,y,z)                                \
-    MD5_PARA_DO(i) tmp2[i] = vxor((x[i]),(y[i]));   \
-    MD5_PARA_DO(i) tmp[i] = vxor(tmp2[i], (z[i]));
+#define MD5_H(x,y,z,i)               \
+    tmp2_##i = vxor((x[i]),(y[i]));   \
+    tmp1_##i = vxor(tmp2_##i, (z[i]));
 
-#define MD5_H2(x,y,z)                               \
-    MD5_PARA_DO(i) tmp[i] = vxor((x[i]), tmp2[i]);
+#define MD5_H2(x,y,z,i)	\
+    tmp1_##i = vxor((x[i]), tmp2_##i);
 #else
-#define MD5_H(x,y,z)                                \
-    MD5_PARA_DO(i) tmp[i] = vxor((x[i]),(y[i]));    \
-    MD5_PARA_DO(i) tmp[i] = vxor((tmp[i]),(z[i]));
+#define MD5_H(x,y,z,i)                \
+    tmp1_##i = vxor((x[i]),(y[i]));    \
+    tmp1_##i = vxor((tmp1_##i),(z[i]));
 
-#define MD5_H2(x,y,z)                               \
-    MD5_PARA_DO(i) tmp[i] = vxor((y[i]),(z[i]));    \
-    MD5_PARA_DO(i) tmp[i] = vxor((tmp[i]),(x[i]));
+#define MD5_H2(x,y,z,i)               \
+    tmp1_##i = vxor((y[i]),(z[i]));    \
+    tmp1_##i = vxor((tmp1_##i),(x[i]));
 #endif
 
-#define MD5_I(x,y,z)                                \
-    MD5_PARA_DO(i) tmp[i] = vandnot((z[i]), mask);  \
-    MD5_PARA_DO(i) tmp[i] = vor((tmp[i]),(x[i]));   \
-    MD5_PARA_DO(i) tmp[i] = vxor((tmp[i]),(y[i]));
+#define MD5_I(x,y,z,i)                \
+    tmp1_##i = vandnot((z[i]), mask);  \
+    tmp1_##i = vor((tmp1_##i),(x[i]));   \
+    tmp1_##i = vxor((tmp1_##i),(y[i]));
 
-#define MD5_STEP(f, a, b, c, d, x, t, s)                        \
-    MD5_PARA_DO(i) a[i] = vadd_epi32( a[i], vset1_epi32(t) );   \
-    MD5_PARA_DO(i) a[i] = vadd_epi32( a[i], data[i*16+x] );     \
-    f((b),(c),(d))                                              \
-    MD5_PARA_DO(i) a[i] = vadd_epi32( a[i], tmp[i] );           \
-    MD5_PARA_DO(i) a[i] = vroti_epi32( a[i], (s) );             \
-    MD5_PARA_DO(i) a[i] = vadd_epi32( a[i], b[i] );
+#if SIMD_PARA_MD5 == 1
+#define MD5_STEP(f, a, b, c, d, x, t, s)        \
+    a[0] = vadd_epi32( a[0], vset1_epi32(t) );   \
+    a[0] = vadd_epi32( a[0], data[0*16+x] );     \
+    f((b),(c),(d), 0)                           \
+    a[0] = vadd_epi32( a[0], tmp1_0 );           \
+    a[0] = vroti_epi32( a[0], (s) );             \
+    a[0] = vadd_epi32( a[0], b[0] );
 
-#define MD5_STEP_r16(f, a, b, c, d, x, t, s)                    \
-    MD5_PARA_DO(i) a[i] = vadd_epi32( a[i], vset1_epi32(t) );   \
-    MD5_PARA_DO(i) a[i] = vadd_epi32( a[i], data[i*16+x] );     \
-    f((b),(c),(d))                                              \
-    MD5_PARA_DO(i) a[i] = vadd_epi32( a[i], tmp[i] );           \
-    MD5_PARA_DO(i) a[i] = vroti16_epi32( a[i], (s) );           \
-    MD5_PARA_DO(i) a[i] = vadd_epi32( a[i], b[i] );
+#define MD5_STEP_r16(f, a, b, c, d, x, t, s)    \
+    a[0] = vadd_epi32( a[0], vset1_epi32(t) );   \
+    a[0] = vadd_epi32( a[0], data[0*16+x] );     \
+    f((b),(c),(d), 0)                           \
+    a[0] = vadd_epi32( a[0], tmp1_0 );           \
+    a[0] = vroti16_epi32( a[0], (s) );           \
+    a[0] = vadd_epi32( a[0], b[0] );
+
+#elif SIMD_PARA_MD5 == 2
+#define MD5_STEP(f, a, b, c, d, x, t, s)        \
+    a[0] = vadd_epi32( a[0], vset1_epi32(t) );   \
+    a[1] = vadd_epi32( a[1], vset1_epi32(t) );   \
+    a[0] = vadd_epi32( a[0], data[0*16+x] );     \
+    a[1] = vadd_epi32( a[1], data[1*16+x] );     \
+    f((b),(c),(d), 0)                           \
+    f((b),(c),(d), 1)                           \
+    a[0] = vadd_epi32( a[0], tmp1_0 );           \
+    a[1] = vadd_epi32( a[1], tmp1_1 );           \
+    a[0] = vroti_epi32( a[0], (s) );             \
+    a[1] = vroti_epi32( a[1], (s) );             \
+    a[0] = vadd_epi32( a[0], b[0] );             \
+    a[1] = vadd_epi32( a[1], b[1] );
+
+#define MD5_STEP_r16(f, a, b, c, d, x, t, s)    \
+    a[0] = vadd_epi32( a[0], vset1_epi32(t) );   \
+    a[1] = vadd_epi32( a[1], vset1_epi32(t) );   \
+    a[0] = vadd_epi32( a[0], data[0*16+x] );     \
+    a[1] = vadd_epi32( a[1], data[1*16+x] );     \
+    f((b),(c),(d), 0)                           \
+    f((b),(c),(d), 1)                           \
+    a[0] = vadd_epi32( a[0], tmp1_0 );           \
+    a[1] = vadd_epi32( a[1], tmp1_1 );           \
+    a[0] = vroti16_epi32( a[0], (s) );           \
+    a[1] = vroti16_epi32( a[1], (s) );           \
+    a[0] = vadd_epi32( a[0], b[0] );             \
+    a[1] = vadd_epi32( a[1], b[1] );
+
+#elif SIMD_PARA_MD5 == 3
+#define MD5_STEP(f, a, b, c, d, x, t, s)        \
+    a[0] = vadd_epi32( a[0], vset1_epi32(t) );   \
+    a[1] = vadd_epi32( a[1], vset1_epi32(t) );   \
+    a[2] = vadd_epi32( a[2], vset1_epi32(t) );   \
+    a[0] = vadd_epi32( a[0], data[0*16+x] );     \
+    a[1] = vadd_epi32( a[1], data[1*16+x] );     \
+    a[2] = vadd_epi32( a[2], data[2*16+x] );     \
+    f((b),(c),(d), 0)                           \
+    f((b),(c),(d), 1)                           \
+    f((b),(c),(d), 2)                           \
+    a[0] = vadd_epi32( a[0], tmp1_0 );           \
+    a[1] = vadd_epi32( a[1], tmp1_1 );           \
+    a[2] = vadd_epi32( a[2], tmp1_2 );           \
+    a[0] = vroti_epi32( a[0], (s) );             \
+    a[1] = vroti_epi32( a[1], (s) );             \
+    a[2] = vroti_epi32( a[2], (s) );             \
+    a[0] = vadd_epi32( a[0], b[0] );             \
+    a[1] = vadd_epi32( a[1], b[1] );             \
+    a[2] = vadd_epi32( a[2], b[2] );
+
+#define MD5_STEP_r16(f, a, b, c, d, x, t, s)    \
+    a[0] = vadd_epi32( a[0], vset1_epi32(t) );   \
+    a[1] = vadd_epi32( a[1], vset1_epi32(t) );   \
+    a[2] = vadd_epi32( a[2], vset1_epi32(t) );   \
+    a[0] = vadd_epi32( a[0], data[0*16+x] );     \
+    a[1] = vadd_epi32( a[1], data[1*16+x] );     \
+    a[2] = vadd_epi32( a[2], data[2*16+x] );     \
+    f((b),(c),(d), 0)                           \
+    f((b),(c),(d), 1)                           \
+    f((b),(c),(d), 2)                           \
+    a[0] = vadd_epi32( a[0], tmp1_0 );           \
+    a[1] = vadd_epi32( a[1], tmp1_1 );           \
+    a[2] = vadd_epi32( a[2], tmp1_2 );           \
+    a[0] = vroti16_epi32( a[0], (s) );           \
+    a[1] = vroti16_epi32( a[1], (s) );           \
+    a[2] = vroti16_epi32( a[2], (s) );           \
+    a[0] = vadd_epi32( a[0], b[0] );             \
+    a[1] = vadd_epi32( a[1], b[1] );             \
+    a[2] = vadd_epi32( a[2], b[2] );
+
+#elif SIMD_PARA_MD5 == 4
+#define MD5_STEP(f, a, b, c, d, x, t, s)        \
+    a[0] = vadd_epi32( a[0], vset1_epi32(t) );   \
+    a[1] = vadd_epi32( a[1], vset1_epi32(t) );   \
+    a[2] = vadd_epi32( a[2], vset1_epi32(t) );   \
+    a[3] = vadd_epi32( a[3], vset1_epi32(t) );   \
+    a[0] = vadd_epi32( a[0], data[0*16+x] );     \
+    a[1] = vadd_epi32( a[1], data[1*16+x] );     \
+    a[2] = vadd_epi32( a[2], data[2*16+x] );     \
+    a[3] = vadd_epi32( a[3], data[3*16+x] );     \
+    f((b),(c),(d), 0)                           \
+    f((b),(c),(d), 1)                           \
+    f((b),(c),(d), 2)                           \
+    f((b),(c),(d), 3)                           \
+    a[0] = vadd_epi32( a[0], tmp1_0 );           \
+    a[1] = vadd_epi32( a[1], tmp1_1 );           \
+    a[2] = vadd_epi32( a[2], tmp1_2 );           \
+    a[3] = vadd_epi32( a[3], tmp1_3 );           \
+    a[0] = vroti_epi32( a[0], (s) );             \
+    a[1] = vroti_epi32( a[1], (s) );             \
+    a[2] = vroti_epi32( a[2], (s) );             \
+    a[3] = vroti_epi32( a[3], (s) );             \
+    a[0] = vadd_epi32( a[0], b[0] );             \
+    a[1] = vadd_epi32( a[1], b[1] );             \
+    a[2] = vadd_epi32( a[2], b[2] );             \
+    a[3] = vadd_epi32( a[3], b[3] );
+
+#define MD5_STEP_r16(f, a, b, c, d, x, t, s)    \
+    a[0] = vadd_epi32( a[0], vset1_epi32(t) );   \
+    a[1] = vadd_epi32( a[1], vset1_epi32(t) );   \
+    a[2] = vadd_epi32( a[2], vset1_epi32(t) );   \
+    a[3] = vadd_epi32( a[3], vset1_epi32(t) );   \
+    a[0] = vadd_epi32( a[0], data[0*16+x] );     \
+    a[1] = vadd_epi32( a[1], data[1*16+x] );     \
+    a[2] = vadd_epi32( a[2], data[2*16+x] );     \
+    a[3] = vadd_epi32( a[3], data[3*16+x] );     \
+    f((b),(c),(d), 0)                           \
+    f((b),(c),(d), 1)                           \
+    f((b),(c),(d), 2)                           \
+    f((b),(c),(d), 3)                           \
+    a[0] = vadd_epi32( a[0], tmp1_0 );           \
+    a[1] = vadd_epi32( a[1], tmp1_1 );           \
+    a[2] = vadd_epi32( a[2], tmp1_2 );           \
+    a[3] = vadd_epi32( a[3], tmp1_3 );           \
+    a[0] = vroti16_epi32( a[0], (s) );           \
+    a[1] = vroti16_epi32( a[1], (s) );           \
+    a[2] = vroti16_epi32( a[2], (s) );           \
+    a[3] = vroti16_epi32( a[3], (s) );           \
+    a[0] = vadd_epi32( a[0], b[0] );             \
+    a[1] = vadd_epi32( a[1], b[1] );             \
+    a[2] = vadd_epi32( a[2], b[2] );             \
+    a[3] = vadd_epi32( a[3], b[3] );
+
+#else
+error PARA NOT SUPPORTED
+#endif
 
 void SSEmd5body(vtype* _data, unsigned int *out,
                 ARCH_WORD_32 *reload_state, unsigned SSEi_flags)
@@ -115,8 +243,27 @@ void SSEmd5body(vtype* _data, unsigned int *out,
 	vtype b[SIMD_PARA_MD5];
 	vtype c[SIMD_PARA_MD5];
 	vtype d[SIMD_PARA_MD5];
-	vtype tmp[SIMD_PARA_MD5];
-	vtype tmp2[SIMD_PARA_MD5];
+	vtype tmp1_0;
+	vtype tmp2_0;
+#if SIMD_PARA_MD5 > 1
+	vtype tmp1_1;
+	vtype tmp2_1;
+#endif
+#if SIMD_PARA_MD5 > 2
+	vtype tmp1_2;
+	vtype tmp2_2;
+#endif
+#if SIMD_PARA_MD5 > 3
+	vtype tmp1_3;
+	vtype tmp2_3;
+#endif
+#if SIMD_PARA_MD5 > 4
+	vtype tmp1_4;
+	vtype tmp2_4;
+#endif
+#if SIMD_PARA_MD5 > 5
+#error SIMD_PARA over 5 is not supported
+#endif
 	vtype mask;
 	unsigned int i;
 	vtype *data;
@@ -1404,23 +1551,49 @@ void SSESHA1body(vtype* _data, ARCH_WORD_32 *out, ARCH_WORD_32 *reload_state,
 #define SHA256_PARA_DO(x) for (x = 0; x < SIMD_PARA_SHA256; ++x)
 
 #undef R
-#define R(t)                                                            \
+#define R(t, i)	  \
 {																		\
-    SHA256_PARA_DO(i) tmp1[i] = vadd_epi32(s1(_w[i].w[(t-2)&0xf]), _w[i].w[(t-7)&0xf]); \
-    SHA256_PARA_DO(i) tmp2[i] = vadd_epi32(s0(_w[i].w[(t-15)&0xf]), _w[i].w[(t-16)&0xf]); \
-    SHA256_PARA_DO(i) _w[i].w[(t)&0xf] = vadd_epi32(tmp1[i], tmp2[i]);		\
+    tmp1_##i = vadd_epi32(s1(_w[i].w[(t-2)&0xf]), _w[i].w[(t-7)&0xf]); \
+    tmp2_##i = vadd_epi32(s0(_w[i].w[(t-15)&0xf]), _w[i].w[(t-16)&0xf]); \
+    _w[i].w[(t)&0xf] = vadd_epi32(tmp1_##i, tmp2_##i);		\
 }
 
+#if SIMD_PARA_SHA256 == 1
 #define SHA256_STEP(a,b,c,d,e,f,g,h,x,K)                                \
-    SHA256_PARA_DO(i) tmp1[i] = vadd_epi32(h[i],    S1(e[i]));          \
-    SHA256_PARA_DO(i) tmp1[i] = vadd_epi32(tmp1[i], Ch(e[i],f[i],g[i])); \
-    SHA256_PARA_DO(i) tmp1[i] = vadd_epi32(tmp1[i], vset1_epi32(K));    \
-    SHA256_PARA_DO(i) tmp1[i] = vadd_epi32(tmp1[i], _w[i].w[(x)&0xf]);  \
-    SHA256_PARA_DO(i) tmp2[i] = vadd_epi32(S0(a[i]),Maj(a[i],b[i],c[i])); \
-    SHA256_PARA_DO(i) d[i]    = vadd_epi32(tmp1[i], d[i]);              \
-    SHA256_PARA_DO(i) h[i]    = vadd_epi32(tmp1[i], tmp2[i]);           \
-    if (x < 48) R(x);
+    tmp1_0 = vadd_epi32(h[0],    S1(e[0]));          \
+    tmp1_0 = vadd_epi32(tmp1_0, Ch(e[0],f[0],g[0])); \
+    tmp1_0 = vadd_epi32(tmp1_0, vset1_epi32(K));    \
+    tmp1_0 = vadd_epi32(tmp1_0, _w[0].w[(x)&0xf]);  \
+    tmp2_0 = vadd_epi32(S0(a[0]),Maj(a[0],b[0],c[0])); \
+    d[0]    = vadd_epi32(tmp1_0, d[0]);              \
+    h[0]    = vadd_epi32(tmp1_0, tmp2_0);           \
+    if (x < 48) R(x, 0);
 
+#elif SIMD_PARA_SHA256 == 2
+#define SHA256_STEP(a,b,c,d,e,f,g,h,x,K)                                \
+    tmp1_0 = vadd_epi32(h[0],    S1(e[0]));          \
+    tmp1_1 = vadd_epi32(h[1],    S1(e[1]));          \
+    tmp1_0 = vadd_epi32(tmp1_0, Ch(e[0],f[0],g[0])); \
+    tmp1_1 = vadd_epi32(tmp1_1, Ch(e[1],f[1],g[1])); \
+    tmp1_0 = vadd_epi32(tmp1_0, vset1_epi32(K));    \
+    tmp1_1 = vadd_epi32(tmp1_1, vset1_epi32(K));    \
+    tmp1_0 = vadd_epi32(tmp1_0, _w[0].w[(x)&0xf]);  \
+    tmp1_1 = vadd_epi32(tmp1_1, _w[1].w[(x)&0xf]);  \
+    tmp2_0 = vadd_epi32(S0(a[0]),Maj(a[0],b[0],c[0])); \
+    tmp2_1 = vadd_epi32(S0(a[1]),Maj(a[1],b[1],c[1])); \
+    d[0]    = vadd_epi32(tmp1_0, d[0]);              \
+    d[1]    = vadd_epi32(tmp1_1, d[1]);              \
+    h[0]    = vadd_epi32(tmp1_0, tmp2_0);           \
+    h[1]    = vadd_epi32(tmp1_1, tmp2_1);           \
+    if (x < 48)                                     \
+    {	  \
+	    R(x, 0); \
+	    R(x, 1); \
+    }
+
+#else
+#error PARA NOT SUPPORTED
+#endif
 
 void SSESHA256body(vtype *data, ARCH_WORD_32 *out, ARCH_WORD_32 *reload_state, unsigned SSEi_flags)
 {
@@ -1436,7 +1609,28 @@ void SSESHA256body(vtype *data, ARCH_WORD_32 *out, ARCH_WORD_32 *reload_state, u
 		vtype w[16];
 		ARCH_WORD_32 p[16*sizeof(vtype)/sizeof(ARCH_WORD_32)];
 	}_w[SIMD_PARA_SHA256];
-	vtype tmp1[SIMD_PARA_SHA256], tmp2[SIMD_PARA_SHA256], *w = NULL;
+	vtype *w = NULL;
+	vtype tmp1_0;
+	vtype tmp2_0;
+#if SIMD_PARA_SHA256 > 1
+	vtype tmp1_1;
+	vtype tmp2_1;
+#endif
+#if SIMD_PARA_SHA256 > 2
+	vtype tmp1_2;
+	vtype tmp2_2;
+#endif
+#if SIMD_PARA_SHA256 > 3
+	vtype tmp1_3;
+	vtype tmp2_3;
+#endif
+#if SIMD_PARA_SHA256 > 4
+	vtype tmp1_4;
+	vtype tmp2_4;
+#endif
+#if SIMD_PARA_SHA256 > 5
+#error SIMD_PARA over 5 is not supported
+#endif
 	ARCH_WORD_32 *saved_key=0;
 
 	unsigned int i, k;
