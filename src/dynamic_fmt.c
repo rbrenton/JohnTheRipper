@@ -70,7 +70,7 @@ static DYNAMIC_primitive_funcp _Funcs_1[] =
 #ifndef DYNAMIC_DISABLED
 
 #ifdef SIMD_COEF_32
-#include "sse-intrinsics.h"
+#include "simd-intrinsics.h"
 #endif
 
 #include "misc.h"
@@ -83,6 +83,7 @@ static DYNAMIC_primitive_funcp _Funcs_1[] =
 #include "options.h"
 #include "config.h"
 #include "sha.h"
+#include "sha2.h"
 #include "gost.h"
 #include "sph_haval.h"
 #include "sph_ripemd.h"
@@ -109,6 +110,18 @@ static DYNAMIC_primitive_funcp _Funcs_1[] =
 #define WHIRLPOOL_Update(a,b,c)   sph_whirlpool(a,b,c)
 #define WHIRLPOOL_Final(a,b)      sph_whirlpool_close(b,a)
 #endif
+
+#include "KeccakHash.h"
+#define KECCAK_CTX                  Keccak_HashInstance
+#define KECCAK_Update(a,b,c)        Keccak_HashUpdate(a,b,(c)*8)
+#define KECCAK_Final(a,b)           Keccak_HashFinal(b,a)
+#define KECCAK_256_Init(hash)       Keccak_HashInitialize(hash, 1088,  512, 256, 0x01)
+#define KECCAK_512_Init(hash)       Keccak_HashInitialize(hash,  576, 1024, 512, 0x01)
+// FIPS202 complient
+#define SHA3_224_Init(hash)         Keccak_HashInitialize(hash, 1152,  448, 224, 0x06)
+#define SHA3_256_Init(hash)         Keccak_HashInitialize(hash, 1088,  512, 256, 0x06)
+#define SHA3_384_Init(hash)         Keccak_HashInitialize(hash,  832,  768, 384, 0x06)
+#define SHA3_512_Init(hash)         Keccak_HashInitialize(hash,  576, 1024, 512, 0x06)
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -229,6 +242,7 @@ MD5_IN *input_buf_X86;
 MD5_IN *input_buf2_X86;
 unsigned int *total_len_X86;
 unsigned int *total_len2_X86;
+BIG_HASH_OUT dynamic_BHO[4];
 
 static int keys_dirty;
 // We store the salt here
@@ -400,7 +414,7 @@ static int valid(char *ciphertext, struct fmt_main *pFmt)
 		// jgypwqm.JsMssPLiS8YQ00$BaaaaaSX
 		unsigned int len;
 		len = base64_valid_length(cp, pPriv->dynamic_base64_inout==3?e_b64_mime:e_b64_crypt, flg_Base64_MIME_TRAIL_EQ_CNT);
-		if (len < 20) return 0;
+		if (len < 20 || len > pPriv->dynamic_SALT_OFFSET+4) return 0;
 		if (pPriv->dynamic_FIXED_SALT_SIZE == 0)
 			return !cp[len];
 		if (pPriv->dynamic_FIXED_SALT_SIZE && cp[len] != '$')
@@ -409,12 +423,6 @@ static int valid(char *ciphertext, struct fmt_main *pFmt)
 			return 0;
 		else if (pPriv->dynamic_FIXED_SALT_SIZE < -1 && strlen(&cp[len+1]) > -(pPriv->dynamic_FIXED_SALT_SIZE))
 			return  0;
-		if ((pPriv->pSetup->startFlags & MGF_PHPassSetup) == MGF_PHPassSetup) {
-			// we have to perform the salt 'length' check here, so we do not process invalid hashes later.
-			int Lcount = atoi64[ARCH_INDEX(cp[23])];
-			if (Lcount < 7 || Lcount > 31)
-				return 0;
-		}
 		return 1;
 	}
 	if (pPriv->dynamic_base64_inout == 2)
@@ -542,15 +550,6 @@ static inline void __nonMP_DynamicFunc__append_from_last_output2_to_input1_as_ba
 	DynamicFunc__append_from_last_output2_to_input1_as_base16(0,m_count,0);
 #else
 	DynamicFunc__append_from_last_output2_to_input1_as_base16();
-#endif
-}
-
-static inline void __nonMP_DynamicFunc__set_input_len_32()
-{
-#ifdef _OPENMP
-	DynamicFunc__set_input_len_32(0,m_count,0);
-#else
-	DynamicFunc__set_input_len_32();
 #endif
 }
 
@@ -764,6 +763,9 @@ static void init(struct fmt_main *pFmt)
 		total_len2_X86 = (unsigned int *)mem_calloc((MAX_KEYS_PER_CRYPT_X86+1), sizeof(*total_len2_X86));
 	}
 
+	for (i = 0; i < 4; ++i)
+		dynamic_BHO[i].dat = mem_calloc_align(BLOCK_LOOPS, sizeof(*(dynamic_BHO[0].dat)), MEM_ALIGN_SIMD);
+
 	gost_init_table();
 	if (!pPriv || (pPriv->init == 1 && !strcmp(curdat.dynamic_WHICH_TYPE_SIG, pPriv->dynamic_WHICH_TYPE_SIG)))
 		return;
@@ -844,6 +846,8 @@ static void init(struct fmt_main *pFmt)
 
 static void done(void)
 {
+	int i;
+
 	MEM_FREE(total_len2_X86);
 	MEM_FREE(total_len_X86);
 	MEM_FREE(input_buf2_X86);
@@ -860,6 +864,8 @@ static void done(void)
 #endif
 	MEM_FREE(eLargeOut);
 	MEM_FREE(md5_unicode_convert);
+	for (i = 0; i < 4; ++i)
+		MEM_FREE(dynamic_BHO[i].dat);
 }
 
 /*********************************************************************************
@@ -872,6 +878,7 @@ static char *prepare(char *split_fields[10], struct fmt_main *pFmt)
 	private_subformat_data *pPriv = pFmt->private.data;
 	char Tmp[80];
 	int i;
+	int trim_u=0;
 
 	char *cpBuilding=split_fields[1];
 
@@ -925,7 +932,18 @@ static char *prepare(char *split_fields[10], struct fmt_main *pFmt)
 	}
 	// At this point, max length of cpBuilding is 491 (if it was a md5_gen signature)
 
+	// allow a raw hash, if there is a $u but no salt
+	if (pPriv->nUserName && strlen(split_fields[0]) && !strchr(cpBuilding, '$') && strcmp(split_fields[0], "?")) {
+		static char ct[496];
+		strcpy(ct, cpBuilding);
+		strcat(ct, "$$U");
+		cpBuilding = ct;
+		trim_u=1;
+	}
+
 	cpBuilding = FixupIfNeeded(cpBuilding, pPriv);
+	if (trim_u)
+		cpBuilding[strlen(cpBuilding)-3] = 0;
 
 	// at this point max length is still < 512.  491 + strlen($dynamic_xxxxx$) is 506
 
@@ -1191,7 +1209,13 @@ static void set_key(char *key, int index)
 #ifdef SIMD_COEF_32
 		if (dynamic_use_sse==1) {
 			// code derived from rawMD5_fmt_plug.c code from magnum
+#if ARCH_ALLOWS_UNALIGNED
 			const ARCH_WORD_32 *key32 = (ARCH_WORD_32*)key;
+#else
+			char buf_aligned[PLAINTEXT_LENGTH + 1] JTR_ALIGN(sizeof(uint32_t));
+			const ARCH_WORD_32 *key32 = is_aligned(key, sizeof(uint32_t)) ?
+					(uint32_t*)key : (uint32_t*)strcpy(buf_aligned, key);
+#endif
 			unsigned int idx = ( ((unsigned int)index)/SIMD_COEF_32);
 			ARCH_WORD_32 *keybuffer = &input_buf[idx].w[index&(SIMD_COEF_32-1)];
 			ARCH_WORD_32 *keybuf_word = keybuffer;
@@ -1520,7 +1544,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	// single crypt.  That eliminates almost 1/2 of the calls to md5_crypt() for the format show in this example.
 	if (keys_dirty)
 	{
-		if (curdat.store_keys_normal_but_precompute_md5_to_output2)
+		if (curdat.store_keys_normal_but_precompute_hash_to_output2)
 		{
 			keys_dirty = 0;
 			__nonMP_DynamicFunc__clean_input2();
@@ -1531,13 +1555,13 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 			//if (curdat.using_flat_buffers_sse2_ok) {
 			if (curdat.dynamic_use_sse == 0) {
-				if (curdat.store_keys_normal_but_precompute_md5_to_output2_base16_to_input1) {
+				if (curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1) {
 #ifdef _OPENMP
 #define CASE(H) case MGF__##H: DynamicFunc__##H##_crypt_input2_overwrite_input1(0,m_count,0); break
 #else
 #define CASE(H) case MGF__##H: DynamicFunc__##H##_crypt_input2_overwrite_input1(); break
 #endif
-					switch(curdat.store_keys_normal_but_precompute_md5_to_output2_base16_type)
+					switch(curdat.store_keys_normal_but_precompute_hash_to_output2_base16_type)
 					{
 						CASE(MD5);
 						CASE(MD4);
@@ -1574,24 +1598,26 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 						CASE(SKEIN256);
 						CASE(SKEIN384);
 						CASE(SKEIN512);
+						CASE(SHA3_224);
+						CASE(SHA3_256);
+						CASE(SHA3_384);
+						CASE(SHA3_512);
+						CASE(KECCAK_256);
+						CASE(KECCAK_512);
+						// LARGE_HASH_EDIT_POINT
 					}
-				} else if (curdat.store_keys_normal_but_precompute_md5_to_output2_base16_to_input1_offset32) {
+				} else if (curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1_offsetX) {
 					unsigned int i;
 					for (i = 0; i < m_count; ++i)
-						total_len_X86[i] = 32;
-#ifdef _OPENMP
-					DynamicFunc__MD5_crypt_input2_append_input1(0,m_count,0);
-#else
-					DynamicFunc__MD5_crypt_input2_append_input1();
-#endif
+						total_len_X86[i] = curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1_offsetX;
 #undef CASE
 #ifdef _OPENMP
-#define CASE(H) case MGF__##H: total_len_X86[i] = 32; DynamicFunc__##H##_crypt_input2_append_input1(0,m_count,0); break
+#define CASE(H) case MGF__##H: DynamicFunc__##H##_crypt_input2_append_input1(0,m_count,0); break
 #else
-#define CASE(H) case MGF__##H: total_len_X86[i] = 32; DynamicFunc__##H##_crypt_input2_append_input1(); break
+#define CASE(H) case MGF__##H: DynamicFunc__##H##_crypt_input2_append_input1(); break
 #endif
 
-					switch(curdat.store_keys_normal_but_precompute_md5_to_output2_base16_type) {
+					switch(curdat.store_keys_normal_but_precompute_hash_to_output2_base16_type) {
 						CASE(MD5);
 						CASE(MD4);
 						CASE(SHA1);
@@ -1627,6 +1653,13 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 						CASE(SKEIN256);
 						CASE(SKEIN384);
 						CASE(SKEIN512);
+						CASE(SHA3_224);
+						CASE(SHA3_256);
+						CASE(SHA3_384);
+						CASE(SHA3_512);
+						CASE(KECCAK_256);
+						CASE(KECCAK_512);
+						// LARGE_HASH_EDIT_POINT
 					}
 				} else {
 					// calls 'old' code (ossl, sorry :(   We should FIND and remove any format
@@ -1635,23 +1668,11 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 				}
 			} else {
 				__possMP_DynamicFunc__crypt2_md5();
-				if (curdat.store_keys_normal_but_precompute_md5_to_output2_base16_to_input1)
+				if (curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1)
 				{
-					if (curdat.store_keys_normal_but_precompute_md5_to_output2_base16_to_input1==2)
+					if (curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1==2)
 						__nonMP_DynamicFunc__SSEtoX86_switch_output2();
 					__nonMP_DynamicFunc__clean_input();
-					__nonMP_DynamicFunc__append_from_last_output2_to_input1_as_base16();
-				}
-				if (curdat.store_keys_normal_but_precompute_md5_to_output2_base16_to_input1_offset32)
-				{
-#ifndef SIMD_COEF_32
-					if (curdat.store_keys_normal_but_precompute_md5_to_output2_base16_to_input1_offset32==2)
-#else
-					if (dynamic_use_sse == 1)
-#endif
-						__nonMP_DynamicFunc__SSEtoX86_switch_output2();
-					__nonMP_DynamicFunc__clean_input();
-					__nonMP_DynamicFunc__set_input_len_32();
 					__nonMP_DynamicFunc__append_from_last_output2_to_input1_as_base16();
 				}
 			}
@@ -1771,42 +1792,42 @@ extern char *MD5_DumpHexStr(void *p);
 
 #if !ARCH_LITTLE_ENDIAN
 // the lower 8 bits is zero on the binary (but filled in on the hash).  We need to dump the low 8
-static int binary_hash_0_64x4(void * binary) { return (((ARCH_WORD_32 *)binary)[0]>>8) & 0xf; }
-static int binary_hash_1_64x4(void * binary) { return (((ARCH_WORD_32 *)binary)[0]>>8) & 0xff; }
-static int binary_hash_2_64x4(void * binary) { return (((ARCH_WORD_32 *)binary)[0]>>8) & 0xfff; }
-static int binary_hash_3_64x4(void * binary) { return (((ARCH_WORD_32 *)binary)[0]>>8) & 0xffff; }
-static int binary_hash_4_64x4(void * binary) { return (((ARCH_WORD_32 *)binary)[0]>>8) & 0xfffff; }
-static int binary_hash_5_64x4(void * binary) { return (((ARCH_WORD_32 *)binary)[0]>>8) & 0xffffff; }
+static int binary_hash_0_64x4(void * binary) { return (((ARCH_WORD_32 *)binary)[0]>>8) & PH_MASK_0; }
+static int binary_hash_1_64x4(void * binary) { return (((ARCH_WORD_32 *)binary)[0]>>8) & PH_MASK_1; }
+static int binary_hash_2_64x4(void * binary) { return (((ARCH_WORD_32 *)binary)[0]>>8) & PH_MASK_2; }
+static int binary_hash_3_64x4(void * binary) { return (((ARCH_WORD_32 *)binary)[0]>>8) & PH_MASK_3; }
+static int binary_hash_4_64x4(void * binary) { return (((ARCH_WORD_32 *)binary)[0]>>8) & PH_MASK_4; }
+static int binary_hash_5_64x4(void * binary) { return (((ARCH_WORD_32 *)binary)[0]>>8) & PH_MASK_5; }
 static int get_hash_0_64x4(int index) {
 #if MD5_X2
-	if (index & 1) return (crypt_key_X86[index>>MD5_X2].x2.w2[0]>>8) & 0xf;
+	if (index & 1) return (crypt_key_X86[index>>MD5_X2].x2.w2[0]>>8) & PH_MASK_0;
 #endif
-	return (crypt_key_X86[index>>MD5_X2].x1.w[0]>>8) & 0xf;}
+	return (crypt_key_X86[index>>MD5_X2].x1.w[0]>>8) & PH_MASK_0;}
 static int get_hash_1_64x4(int index) {
 #if MD5_X2
-	if (index & 1) return (crypt_key_X86[index>>MD5_X2].x2.w2[0]>>8) & 0xff;
+	if (index & 1) return (crypt_key_X86[index>>MD5_X2].x2.w2[0]>>8) & PH_MASK_1;
 #endif
-	return (crypt_key_X86[index>>MD5_X2].x1.w[0]>>8) & 0xff;}
+	return (crypt_key_X86[index>>MD5_X2].x1.w[0]>>8) & PH_MASK_1;}
 static int get_hash_2_64x4(int index) {
 #if MD5_X2
-	if (index & 1) return (crypt_key_X86[index>>MD5_X2].x2.w2[0]>>8) & 0xfff;
+	if (index & 1) return (crypt_key_X86[index>>MD5_X2].x2.w2[0]>>8) & PH_MASK_2;
 #endif
-	return (crypt_key_X86[index>>MD5_X2].x1.w[0]>>8) & 0xfff;}
+	return (crypt_key_X86[index>>MD5_X2].x1.w[0]>>8) & PH_MASK_2;}
 static int get_hash_3_64x4(int index) {
 #if MD5_X2
-	if (index & 1) return (crypt_key_X86[index>>MD5_X2].x2.w2[0]>>8) & 0xffff;
+	if (index & 1) return (crypt_key_X86[index>>MD5_X2].x2.w2[0]>>8) & PH_MASK_3;
 #endif
-	return (crypt_key_X86[index>>MD5_X2].x1.w[0]>>8) & 0xffff;}
+	return (crypt_key_X86[index>>MD5_X2].x1.w[0]>>8) & PH_MASK_3;}
 static int get_hash_4_64x4(int index) {
 #if MD5_X2
-	if (index & 1) return (crypt_key_X86[index>>MD5_X2].x2.w2[0]>>8) & 0xfffff;
+	if (index & 1) return (crypt_key_X86[index>>MD5_X2].x2.w2[0]>>8) & PH_MASK_4;
 #endif
-	return (crypt_key_X86[index>>MD5_X2].x1.w[0]>>8) & 0xfffff;}
+	return (crypt_key_X86[index>>MD5_X2].x1.w[0]>>8) & PH_MASK_4;}
 static int get_hash_5_64x4(int index) {
 #if MD5_X2
-	if (index & 1) return (crypt_key_X86[index>>MD5_X2].x2.w2[0]>>8) & 0xffffff;
+	if (index & 1) return (crypt_key_X86[index>>MD5_X2].x2.w2[0]>>8) & PH_MASK_5;
 #endif
-	return (crypt_key_X86[index>>MD5_X2].x1.w[0]>>8) & 0xffffff;}
+	return (crypt_key_X86[index>>MD5_X2].x1.w[0]>>8) & PH_MASK_5;}
 
 
 #endif
@@ -1816,14 +1837,14 @@ static int get_hash_0(int index)
 #ifdef SIMD_COEF_32
 	if (dynamic_use_sse&1) {
 		unsigned int idx = ( ((unsigned int)index)/SIMD_COEF_32);
-		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & 0xf;
+		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & PH_MASK_0;
 	}
 #endif
 #if MD5_X2
 	if (index & 1)
-		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & 0xf;
+		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & PH_MASK_0;
 #endif
-	return crypt_key_X86[index>>MD5_X2].x1.w[0] & 0xf;
+	return crypt_key_X86[index>>MD5_X2].x1.w[0] & PH_MASK_0;
 }
 
 static int get_hash_1(int index)
@@ -1831,14 +1852,14 @@ static int get_hash_1(int index)
 #ifdef SIMD_COEF_32
 	if (dynamic_use_sse&1) {
 		unsigned int idx = ( ((unsigned int)index)/SIMD_COEF_32);
-		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & 0xff;
+		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & PH_MASK_1;
 	}
 #endif
 #if MD5_X2
 	if (index & 1)
-		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & 0xff;
+		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & PH_MASK_1;
 #endif
-	return crypt_key_X86[index>>MD5_X2].x1.w[0] & 0xff;
+	return crypt_key_X86[index>>MD5_X2].x1.w[0] & PH_MASK_1;
 }
 
 static int get_hash_2(int index)
@@ -1846,14 +1867,14 @@ static int get_hash_2(int index)
 #ifdef SIMD_COEF_32
 	if (dynamic_use_sse&1) {
 		unsigned int idx = ( ((unsigned int)index)/SIMD_COEF_32);
-		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & 0xfff;
+		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & PH_MASK_2;
 	}
 #endif
 #if MD5_X2
 	if (index & 1)
-		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & 0xfff;
+		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & PH_MASK_2;
 #endif
-	return crypt_key_X86[index>>MD5_X2].x1.w[0] & 0xfff;
+	return crypt_key_X86[index>>MD5_X2].x1.w[0] & PH_MASK_2;
 }
 
 static int get_hash_3(int index)
@@ -1861,14 +1882,14 @@ static int get_hash_3(int index)
 #ifdef SIMD_COEF_32
 	if (dynamic_use_sse&1) {
 		unsigned int idx = ( ((unsigned int)index)/SIMD_COEF_32);
-		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & 0xffff;
+		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & PH_MASK_3;
 	}
 #endif
 #if MD5_X2
 	if (index & 1)
-		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & 0xffff;
+		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & PH_MASK_3;
 #endif
-	return crypt_key_X86[index>>MD5_X2].x1.w[0] & 0xffff;
+	return crypt_key_X86[index>>MD5_X2].x1.w[0] & PH_MASK_3;
 }
 
 static int get_hash_4(int index)
@@ -1876,14 +1897,14 @@ static int get_hash_4(int index)
 #ifdef SIMD_COEF_32
 	if (dynamic_use_sse&1) {
 		unsigned int idx = ( ((unsigned int)index)/SIMD_COEF_32);
-		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & 0xfffff;
+		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & PH_MASK_4;
 	}
 #endif
 #if MD5_X2
 	if (index & 1)
-		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & 0xfffff;
+		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & PH_MASK_4;
 #endif
-	return crypt_key_X86[index>>MD5_X2].x1.w[0] & 0xfffff;
+	return crypt_key_X86[index>>MD5_X2].x1.w[0] & PH_MASK_4;
 }
 
 static int get_hash_5(int index)
@@ -1891,14 +1912,14 @@ static int get_hash_5(int index)
 #ifdef SIMD_COEF_32
 	if (dynamic_use_sse&1) {
 		unsigned int idx = ( ((unsigned int)index)/SIMD_COEF_32);
-		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & 0xffffff;
+		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & PH_MASK_5;
 	}
 #endif
 #if MD5_X2
 	if (index & 1)
-		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & 0xffffff;
+		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & PH_MASK_5;
 #endif
-	return crypt_key_X86[index>>MD5_X2].x1.w[0] & 0xffffff;
+	return crypt_key_X86[index>>MD5_X2].x1.w[0] & PH_MASK_5;
 }
 
 static int get_hash_6(int index)
@@ -1906,14 +1927,14 @@ static int get_hash_6(int index)
 #ifdef SIMD_COEF_32
 	if (dynamic_use_sse&1) {
 		unsigned int idx = ( ((unsigned int)index)/SIMD_COEF_32);
-		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & 0x7ffffff;
+		return ((ARCH_WORD_32 *)&(crypt_key[idx].c))[index&(SIMD_COEF_32-1)] & PH_MASK_6;
 	}
 #endif
 #if MD5_X2
 	if (index & 1)
-		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & 0x7ffffff;
+		return crypt_key_X86[index>>MD5_X2].x2.w2[0] & PH_MASK_6;
 #endif
-	return crypt_key_X86[index>>MD5_X2].x1.w[0] & 0x7ffffff;
+	return crypt_key_X86[index>>MD5_X2].x1.w[0] & PH_MASK_6;
 }
 
 
@@ -1930,6 +1951,7 @@ static int get_hash_6(int index)
 
 typedef struct dyna_salt_list_entry {
 	struct dyna_salt_list_entry *next;
+	unsigned len;
 	unsigned char *salt;
 } dyna_salt_list_entry;
 typedef struct {
@@ -1960,6 +1982,7 @@ static unsigned char *AddSaltHash(unsigned char *salt, unsigned int len, unsigne
 	pRet = pNextSaltDataBuf;
 	pSaltHashDataNext->salt = pNextSaltDataBuf;
 	memcpy(pSaltHashDataNext->salt, salt, len);
+	pSaltHashDataNext->len = len;
 	pNextSaltDataBuf += len;
 	nSaltDataBuf -= len;
 
@@ -1988,7 +2011,7 @@ static unsigned char *FindSaltHash(unsigned char *salt, unsigned int len, CRC32_
 	// Ok, we have some salts in this hash list.  Now walk the list, searching for an EQUAL salt.
 	p = SaltHashTab[idx].List.head;
 	while (p) {
-		if (!memcmp((char*)salt, (char*)p->salt, len)) {
+		if (len == p->len && !memcmp((char*)salt, (char*)p->salt, len)) {
 			return p->salt;  // found it!  return this one, so we do not allocate another.
 		}
 		p = p->next;
@@ -2034,7 +2057,7 @@ static unsigned int salt_external_to_internal_convert(unsigned char *extern_salt
 	// the any order has 1 exception of salt_data MUST be first.  So if we get $$2salt2, then we know there is no salt-1 value.
 	unsigned char *salt2=0, *userid=0, *Flds[10];
 	int i, nsalt2=0, nuserid=0, nFlds[10]={0,0,0,0,0,0,0,0,0,0};
-	unsigned char len = strlen((char*)extern_salt), bit;
+	unsigned int len = strlen((char*)extern_salt), bit;
 	unsigned int bit_array=0;
 	unsigned int the_real_len = 6;  // 2 bytes base-8 length, and 4 bytes base-8 bitmap.
 
@@ -2240,6 +2263,8 @@ static void *get_salt(char *ciphertext)
 				memset(Salt,0,SALT_SIZE+1);base64_convert(Buf,e_b64_raw,S,Salt,e_b64_hex,SALT_SIZE, 0);break; }
 #define OSSL_CASE(H,C,S)  case MGF__##H: {C##_CTX c;H##_Init(&c);H##_Update(&c,Salt,slen);H##_Final(Buf,&c); \
 				memset(Salt,0,SALT_SIZE+1);base64_convert(Buf,e_b64_raw,S,Salt,e_b64_hex,SALT_SIZE, 0);break; }
+#define KECCAK_CASE(H,S)  case MGF__##H: {KECCAK_CTX c;H##_Init(&c);KECCAK_Update(&c,(BitSequence*)Salt,slen);KECCAK_Final(Buf,&c); \
+				memset(Salt,0,SALT_SIZE+1);base64_convert(Buf,e_b64_raw,S,Salt,e_b64_hex,SALT_SIZE, 0);break; }
 
 			case MGF__MD5:
 			{
@@ -2311,16 +2336,23 @@ static void *get_salt(char *ciphertext)
 			SPH_CASE(HAVAL256_3,haval256_3,32)
 			SPH_CASE(HAVAL256_4,haval256_4,32)
 			SPH_CASE(HAVAL256_5,haval256_5,32)
-			SPH_CASE(MD2,md2,16);
-			SPH_CASE(PANAMA,panama,32);
-			SPH_CASE(SKEIN224,skein224,28);
-			SPH_CASE(SKEIN256,skein256,32);
-			SPH_CASE(SKEIN384,skein384,48);
-			SPH_CASE(SKEIN512,skein512,64);
+			SPH_CASE(MD2,md2,16)
+			SPH_CASE(PANAMA,panama,32)
+			SPH_CASE(SKEIN224,skein224,28)
+			SPH_CASE(SKEIN256,skein256,32)
+			SPH_CASE(SKEIN384,skein384,48)
+			SPH_CASE(SKEIN512,skein512,64)
+			KECCAK_CASE(SHA3_224,28)
+			KECCAK_CASE(SHA3_256,32)
+			KECCAK_CASE(SHA3_384,48)
+			KECCAK_CASE(SHA3_512,64)
+			KECCAK_CASE(KECCAK_256,32)
+			KECCAK_CASE(KECCAK_512,64)
+			// LARGE_HASH_EDIT_POINT
 
 			default:
 			{
-				error("Invalid dynamic flags seen.  Data type not yet defined\n");
+				error_msg("Invalid dynamic flags seen.  Data type not yet defined\n");
 			}
 		}
 	}
@@ -2329,34 +2361,6 @@ static void *get_salt(char *ciphertext)
 
 	// Now convert this into a stored salt, or find the 'already' stored same salt.
 	saltp = HashSalt((unsigned char*)saltIntBuf, the_real_len);
-	memcpy(union_x.salt_p, &saltp, sizeof(saltp));
-	return union_x.salt_p;
-}
-
-/*********************************************************************************
- * 'special' get salt function for phpass. We return the 8 bytes salt, followed by
- * the 1 byte loop count.  'normally' in phpass format, that order is reversed.
- * we do it this way, since our 'primitive' functions would not know to treat the
- * salt any differently for phpass.  Thus the primitives are told about the first
- * 8 bytes (and not the full 9).  But the phpass crypt function uses that 9th byte.
- *********************************************************************************/
-static void *salt_phpass(char *ciphertext)
-{
-	unsigned char salt[20], *saltp;
-	static union x {
-		unsigned char salt_p[sizeof(unsigned char*)];
-		unsigned long p[1];
-	} union_x;
-
-	if (!strncmp(ciphertext, "$dynamic_", 9)) {
-		ciphertext += 9;
-		while (*ciphertext != '$')
-			++ciphertext;
-	}
-	sprintf((char*)salt, "100000%8.8s%c", &ciphertext[25], ciphertext[24]);
-
-	// Now convert this into a stored salt, or find the 'already' stored same salt.
-	saltp = HashSalt(salt, 15);
 	memcpy(union_x.salt_p, &saltp, sizeof(saltp));
 	return union_x.salt_p;
 }
@@ -2551,7 +2555,7 @@ static char *source_64_hex(char *source, void *binary)
 }
 
 /*********************************************************************************
- * Gets the binary value from a base-64 hash (such as phpass)
+ * Gets the binary value from a base-64 hash
  *********************************************************************************/
 
 static void * binary_b64m(char *ciphertext)
@@ -2679,8 +2683,7 @@ static void * binary_b64_4x6(char *ciphertext)
 
 /*********************************************************************************
  * Here is the main mdg_generic fmt_main. NOTE in its default settings, it is
- * ready to handle base-16 hashes.  The phpass stuff will be linked in later, IF
- * needed.
+ * ready to handle base-16 hashes.
  *********************************************************************************/
 static struct fmt_main fmt_Dynamic =
 {
@@ -2712,12 +2715,10 @@ static struct fmt_main fmt_Dynamic =
 		MAX_KEYS_PER_CRYPT_X86,
 #endif
 #ifdef _OPENMP
-		FMT_OMP |
+		FMT_OMP | FMT_OMP_BAD |
 #endif
 		FMT_CASE | FMT_8_BIT,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		dynamic_tests
 	}, {
 		init,
@@ -2728,9 +2729,7 @@ static struct fmt_main fmt_Dynamic =
 		split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -4004,6 +4003,20 @@ void DynamicFunc__set_input_len_32(DYNA_OMP_PARAMS)
 	j = 0;
 	til = m_count;
 #endif
+	for (; j < til; ++j)
+		total_len_X86[j] = 32;
+}
+
+void DynamicFunc__set_input_len_32_cleartop(DYNA_OMP_PARAMS)
+{
+	unsigned int j, til;
+#ifdef _OPENMP
+	til = last;
+	j = first;
+#else
+	j = 0;
+	til = m_count;
+#endif
 #ifdef SIMD_COEF_32
 	if (dynamic_use_sse==1) {
 		j /= SIMD_COEF_32;
@@ -4019,19 +4032,18 @@ void DynamicFunc__set_input_len_32(DYNA_OMP_PARAMS)
 		return;
 	}
 #endif
-	for (; j < til; ++j)
-	{
+	for (; j < til; ++j) {
 		total_len_X86[j] = 32;
 #if !ARCH_LITTLE_ENDIAN
 #if MD5_X2
 		if (j&1) {
-			//MD5_swap(input_buf_X86[j>>MD5_X2].x2.w2, input_buf_X86[j>>MD5_X2].x2.w2, 8);
+			//MD5_swap(input_buf_X86[j>>MD5_X2].x2.w2, input_buf2_X86[j>>MD5_X2].x2.w2, 8);
 			memset(&(input_buf_X86[j>>MD5_X2].x2.B2[32]), 0, 24);
 		}
 		else
 #endif
 		{
-			//MD5_swap(input_buf_X86[j>>MD5_X2].x1.w, input_buf_X86[j>>MD5_X2].x1.w, 8);
+			//MD5_swap(input_buf_X86[j>>MD5_X2].x1.w, input_buf2_X86[j>>MD5_X2].x1.w, 8);
 			memset(&(input_buf_X86[j>>MD5_X2].x1.B[32]), 0, 24);
 		}
 #endif
@@ -4039,6 +4051,19 @@ void DynamicFunc__set_input_len_32(DYNA_OMP_PARAMS)
 }
 
 void DynamicFunc__set_input2_len_32(DYNA_OMP_PARAMS)
+{
+	unsigned int j, til;
+#ifdef _OPENMP
+	til = last;
+	j = first;
+#else
+	j = 0;
+	til = m_count;
+#endif
+	for (; j < til; ++j)
+		total_len2_X86[j] = 32;
+}
+void DynamicFunc__set_input2_len_32_cleartop(DYNA_OMP_PARAMS)
 {
 	unsigned int j, til;
 #ifdef _OPENMP
@@ -4092,39 +4117,25 @@ void DynamicFunc__set_input_len_40(DYNA_OMP_PARAMS)
 	j = 0;
 	til = m_count;
 #endif
-#ifdef SIMD_COEF_32
-	if (dynamic_use_sse==1) {
-		j /= SIMD_COEF_32;
-		til = (til+SIMD_COEF_32-1)/SIMD_COEF_32;
-		for (; j < til; ++j)
-		{
-			unsigned int k;
-			for (k = 0; k < SIMD_COEF_32; ++k) {
-				input_buf[j].c[GETPOS(40, k&(SIMD_COEF_32-1))] = 0x80;
-				total_len[j][k] = 40;
-			}
-		}
-		return;
-	}
-#endif
 	for (; j < til; ++j)
-	{
 		total_len_X86[j] = 40;
-#if !ARCH_LITTLE_ENDIAN
-#if MD5_X2
-		if (j&1) {
-			memset(&(input_buf_X86[j>>MD5_X2].x2.B2[40]), 0, 16);
-		}
-		else
-#endif
-		{
-			memset(&(input_buf_X86[j>>MD5_X2].x1.B[40]), 0, 16);
-		}
-#endif
-	}
 }
 
 void DynamicFunc__set_input2_len_40(DYNA_OMP_PARAMS)
+{
+	unsigned int j, til;
+#ifdef _OPENMP
+	til = last;
+	j = first;
+#else
+	j = 0;
+	til = m_count;
+#endif
+	for (; j < til; ++j)
+		total_len2_X86[j] = 40;
+}
+
+void DynamicFunc__set_input2_len_40_cleartop(DYNA_OMP_PARAMS)
 {
 	unsigned int j, til;
 #ifdef _OPENMP
@@ -4177,10 +4188,8 @@ void DynamicFunc__set_input_len_64(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_64 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_64 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len_X86[j] = 64;
@@ -4197,10 +4206,8 @@ void DynamicFunc__set_input2_len_64(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_64 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_64 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len2_X86[j] = 64;
@@ -4217,10 +4224,8 @@ void DynamicFunc__set_input_len_100(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_100 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_100 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j) {
 		unsigned char *cp;
@@ -4248,10 +4253,8 @@ void DynamicFunc__set_input_len_24(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_24 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_24 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len_X86[j] = 24;
@@ -4268,10 +4271,8 @@ void DynamicFunc__set_input_len_28(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_28 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_28 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len_X86[j] = 28;
@@ -4288,10 +4289,8 @@ void DynamicFunc__set_input_len_48(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_48 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_48 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len_X86[j] = 48;
@@ -4308,10 +4307,8 @@ void DynamicFunc__set_input_len_56(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_56 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_56 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len_X86[j] = 56;
@@ -4328,10 +4325,8 @@ void DynamicFunc__set_input_len_80(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_80 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_80 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len_X86[j] = 80;
@@ -4348,10 +4343,8 @@ void DynamicFunc__set_input_len_96(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_96 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_96 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len_X86[j] = 96;
@@ -4368,10 +4361,8 @@ void DynamicFunc__set_input_len_112(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_112 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_112 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len_X86[j] = 112;
@@ -4388,10 +4379,8 @@ void DynamicFunc__set_input_len_128(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_128 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_128 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len_X86[j] = 128;
@@ -4408,10 +4397,8 @@ void DynamicFunc__set_input_len_160(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_160 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_160 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len_X86[j] = 160;
@@ -4428,10 +4415,8 @@ void DynamicFunc__set_input_len_192(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_192 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_192 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len_X86[j] = 192;
@@ -4448,10 +4433,8 @@ void DynamicFunc__set_input_len_256(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_256 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input_len_256 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len_X86[j] = 256;
@@ -4468,10 +4451,8 @@ void DynamicFunc__set_input2_len_24(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_24 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_24 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len2_X86[j] = 24;
@@ -4488,10 +4469,8 @@ void DynamicFunc__set_input2_len_28(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_28 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_28 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len2_X86[j] = 28;
@@ -4508,10 +4487,8 @@ void DynamicFunc__set_input2_len_48(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_48 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_48 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len2_X86[j] = 48;
@@ -4528,10 +4505,8 @@ void DynamicFunc__set_input2_len_56(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_56 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_56 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len2_X86[j] = 56;
@@ -4548,10 +4523,8 @@ void DynamicFunc__set_input2_len_80(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_80 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_80 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len2_X86[j] = 80;
@@ -4568,10 +4541,8 @@ void DynamicFunc__set_input2_len_96(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_96 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_96 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len2_X86[j] = 96;
@@ -4588,10 +4559,8 @@ void DynamicFunc__set_input2_len_112(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_112 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_112 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len2_X86[j] = 112;
@@ -4608,10 +4577,8 @@ void DynamicFunc__set_input2_len_128(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_128 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_128 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len2_X86[j] = 128;
@@ -4628,10 +4595,8 @@ void DynamicFunc__set_input2_len_160(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_160 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_160 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len2_X86[j] = 160;
@@ -4648,10 +4613,8 @@ void DynamicFunc__set_input2_len_192(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_192 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_192 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len2_X86[j] = 192;
@@ -4668,10 +4631,8 @@ void DynamicFunc__set_input2_len_256(DYNA_OMP_PARAMS)
 	til = m_count;
 #endif
 #ifdef SIMD_COEF_32
-	if (dynamic_use_sse == 1) {
-		fprintf(stderr, "Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_256 in SSE2/MMX mode\n");
-		error();
-	}
+	if (dynamic_use_sse == 1)
+		error_msg("Error, in your DYNAMIC script.\nIt is NOT valid to call DynamicFunc__set_input2_len_256 in SSE2/MMX mode\n");
 #endif
 	for (; j < til; ++j)
 		total_len2_X86[j] = 256;
@@ -4865,7 +4826,7 @@ void DynamicFunc__append_input2_from_input2(DYNA_OMP_PARAMS)
 }
 
 #ifdef SIMD_PARA_MD5
-static void SSE_Intrinsics_LoadLens(int side, int i)
+static void SSE_Intrinsics_LoadLens_md5(int side, int i)
 {
 	ARCH_WORD_32 *p;
 	unsigned int j, k;
@@ -4889,17 +4850,38 @@ static void SSE_Intrinsics_LoadLens(int side, int i)
 	}
 }
 #endif
-
+#ifdef SIMD_PARA_MD4
+static void SSE_Intrinsics_LoadLens_md4(int side, int i)
+{
+	ARCH_WORD_32 *p;
+	unsigned int j, k;
+	if (side == 0)
+	{
+		for (j = 0; j < SIMD_PARA_MD4; j++)
+		{
+			p = input_buf[i+j].w;
+			for (k = 0; k < SIMD_COEF_32; k++)
+				p[14*SIMD_COEF_32+k] = total_len[i+j][k] << 3;
+		}
+	}
+	else
+	{
+		for (j = 0; j < SIMD_PARA_MD4; j++)
+		{
+			p = input_buf2[i+j].w;
+			for (k = 0; k < SIMD_COEF_32; k++)
+				p[14*SIMD_COEF_32+k] = total_len2[i+j][k] << 3;
+		}
+	}
+}
+#endif
 /**************************************************************
  * DYNAMIC primitive helper function
  * Encrypts the data in the first input field. The data is
  * still in the binary encrypted format, in the crypt_key.
  * we do not yet convert to base-16.  This is so we can output
  * as base-16, or later, if we add base-64, we can output to
- * that format instead.  Some functions do NOT change from
- * the binary format (such as phpass). Thus if we are doing
- * something like phpass, we would NOT want the conversion
- * to happen at all
+ * that format instead.
  *************************************************************/
 void DynamicFunc__crypt_md5(DYNA_OMP_PARAMS)
 {
@@ -4917,12 +4899,12 @@ void DynamicFunc__crypt_md5(DYNA_OMP_PARAMS)
 		i /= SIMD_COEF_32;
 		if (curdat.store_keys_in_input) {
 			for (; i < til; i += SIMD_PARA_MD5) {
-				SSEmd5body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
+				SIMDmd5body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
 			}
 		} else {
 			for (; i < til; i += SIMD_PARA_MD5) {
-				SSE_Intrinsics_LoadLens(0, i);
-				SSEmd5body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
+				SSE_Intrinsics_LoadLens_md5(0, i);
+				SIMDmd5body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
 			}
 		}
 		return;
@@ -4959,12 +4941,12 @@ void DynamicFunc__crypt_md4(DYNA_OMP_PARAMS)
 		i /= SIMD_COEF_32;
 		if (curdat.store_keys_in_input) {
 			for (; i < til; i += SIMD_PARA_MD4) {
-				SSEmd4body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
+				SIMDmd4body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
 			}
 		} else {
 			for (; i < til; i += SIMD_PARA_MD4) {
-				SSE_Intrinsics_LoadLens(0, i);
-				SSEmd4body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
+				SSE_Intrinsics_LoadLens_md4(0, i);
+				SIMDmd4body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
 			}
 		}
 		return;
@@ -4985,93 +4967,6 @@ void DynamicFunc__crypt_md4(DYNA_OMP_PARAMS)
 #endif
 		DoMD4(input_buf_X86[i>>MD5_X2], len, crypt_key_X86[i>>MD5_X2]);
 	}
-}
-
-// we do provide a NOOP function. This will not kill jtr, BUT output that this function has been REMOVED
-// but it DOES NOT shutdown john.
-void DynamicFunc__FreeBSDMD5Crypt(DYNA_OMP_PARAMS)
-{
-	static int bFirst=1;
-	if (bFirst) {
-		bFirst = 0;
-		fprintf(stderr, "\nERROR, DynamicFunc__FreeBSDMD5Crypt() dynamic primitive is no longer supported.\nThis format is invalid and will not process\n");
-	}
-}
-
-/**************************************************************
- * DYNAMIC primitive helper function
- * Special crypt to handle the 'looping' needed for phpass
- *************************************************************/
-void DynamicFunc__PHPassCrypt(DYNA_OMP_PARAMS)
-{
-	unsigned int Lcount;
-
-	Lcount = atoi64[ARCH_INDEX(cursalt[8])];
-	if (Lcount < 7 || Lcount > 31) {
-		fprintf(stderr, "Error, invalid loop byte in a php salt %s\n",cursalt);
-		error();
-	}
-	Lcount = (1<<Lcount);
-
-	DynamicFunc__clean_input(DYNA_OMP_PARAMSd);
-
-	// First 'round' is md5 of ($s.$p)
-	DynamicFunc__append_salt(DYNA_OMP_PARAMSd);
-	DynamicFunc__append_keys(DYNA_OMP_PARAMSd);
-
-	// The later rounds (variable number, based upon the salt's first byte)
-	//   are ALL done as 16 byte md5 result of prior hash, with the password appeneded
-
-	// crypt, and put the 'raw' 16 byte raw crypt data , into the
-	// input buffer.  We will then append the keys to that, and never
-	// have to append the keys again (we just make sure we do NOT adjust
-	// the amount of bytes to md5 from this point no
-	DynamicFunc__crypt_md5_to_input_raw(DYNA_OMP_PARAMSd);
-
-	// Now append the pass
-	DynamicFunc__append_keys(DYNA_OMP_PARAMSd);
-
-	// NOTE last we do 1 less than the required number of crypts in our loop
-	DynamicFunc__crypt_md5_to_input_raw_Overwrite_NoLen_but_setlen_in_SSE(DYNA_OMP_PARAMSd);
-
-#if !ARCH_LITTLE_ENDIAN
-	// from this point on, we want to have the binary blobs in 'native' big endian
-	// format. Thus, we need to 'unswap' them.  Then the call to the
-	// DynamicFunc__crypt_md5_to_input_raw_Overwrite_NoLen will leave the 16 bytes
-	// output, in big endian (thus needing no swapping).
-	// we only have to 'fix up' the final crypt results.
-#if MD5_X2
-		MD5_swap2(input_buf_X86[0].x1.w, input_buf_X86[0].x2.w2, input_buf_X86[0].x1.w, input_buf_X86[0].x2.w2, 4);
-#else
-		MD5_swap(input_buf_X86[0].x1.w, input_buf_X86[0].x1.w, 4);
-#endif
-#endif
-
-	--Lcount;
-	while(--Lcount)
-		DynamicFunc__crypt_md5_to_input_raw_Overwrite_NoLen(DYNA_OMP_PARAMSd);
-
-	// final crypt is to the normal 'output' buffer, since john uses that to find 'hits'.
-#if !ARCH_LITTLE_ENDIAN
-	// we have to use this function, since we do not want to 'fixup' the
-	// end of the buffer again (it has been put into BE format already.
-	// Thus, simply use the raw_overwrite again, then swap the output that
-	// is found in the input buf to the output buf.
-	DynamicFunc__crypt_md5_to_input_raw_Overwrite_NoLen(DYNA_OMP_PARAMSd);
-#if MD5_X2
-	MD5_swap2(input_buf_X86[0].x1.w, input_buf_X86[0].x2.w2, crypt_key_X86[0].x1.w, crypt_key_X86[0].x2.w2, 4);
-#else
-	MD5_swap(input_buf_X86[0].x1.w, crypt_key_X86[0].x1.w, 4);
-#endif
-	//dump_stuff_msg("crypt0", crypt_key_X86[0].x1.w, 16);
-	//dump_stuff_msg("crypt1", crypt_key_X86[0].x2.w2, 16);
-	//{ 	static int x=0; if (++x == 2) 	exit(0); }
-#else
-	// little endian can use 'original' crypt function.
-	DynamicFunc__crypt_md5(DYNA_OMP_PARAMSd);
-	//dump_stuff_msg("crypt0", crypt_key_X86[0].x1.w, 16);
-	//{ 	static int x=0; if (++x == 8) 	exit(0); }
-#endif
 }
 
 void DynamicFunc__POCrypt(DYNA_OMP_PARAMS)
@@ -5151,8 +5046,8 @@ void DynamicFunc__crypt2_md5(DYNA_OMP_PARAMS)
 		til = (til+SIMD_COEF_32-1)/SIMD_COEF_32;
 		i /= SIMD_COEF_32;
 		for (; i < til; i += SIMD_PARA_MD5) {
-			SSE_Intrinsics_LoadLens(1, i);
-			SSEmd5body(input_buf2[i].c, crypt_key2[i].w, NULL, SSEi_MIXED_IN);
+			SSE_Intrinsics_LoadLens_md5(1, i);
+			SIMDmd5body(input_buf2[i].c, crypt_key2[i].w, NULL, SSEi_MIXED_IN);
 		}
 		return;
 	}
@@ -5187,8 +5082,8 @@ void DynamicFunc__crypt2_md4(DYNA_OMP_PARAMS)
 		til = (til+SIMD_COEF_32-1)/SIMD_COEF_32;
 		i /= SIMD_COEF_32;
 		for (; i < til; i += SIMD_PARA_MD4) {
-			SSE_Intrinsics_LoadLens(1, i);
-			SSEmd4body(input_buf2[i].c, crypt_key2[i].w, NULL, SSEi_MIXED_IN);
+			SSE_Intrinsics_LoadLens_md4(1, i);
+			SIMDmd4body(input_buf2[i].c, crypt_key2[i].w, NULL, SSEi_MIXED_IN);
 		}
 		return;
 	}
@@ -5230,12 +5125,12 @@ void DynamicFunc__crypt_md5_in1_to_out2(DYNA_OMP_PARAMS)
 		i /= SIMD_COEF_32;
 		if (curdat.store_keys_in_input) {
 			for (; i < til; i += SIMD_PARA_MD5) {
-				SSEmd5body(input_buf[i].c, crypt_key2[i].w, NULL, SSEi_MIXED_IN);
+				SIMDmd5body(input_buf[i].c, crypt_key2[i].w, NULL, SSEi_MIXED_IN);
 			}
 		} else {
 			for (; i < til; i += SIMD_PARA_MD5) {
-				SSE_Intrinsics_LoadLens(0, i);
-				SSEmd5body(input_buf[i].c, crypt_key2[i].w, NULL, SSEi_MIXED_IN);
+				SSE_Intrinsics_LoadLens_md5(0, i);
+				SIMDmd5body(input_buf[i].c, crypt_key2[i].w, NULL, SSEi_MIXED_IN);
 			}
 		}
 		return;
@@ -5272,12 +5167,12 @@ void DynamicFunc__crypt_md4_in1_to_out2(DYNA_OMP_PARAMS)
 		i /= SIMD_COEF_32;
 		if (curdat.store_keys_in_input) {
 			for (; i < til; i += SIMD_PARA_MD4) {
-				SSEmd4body(input_buf[i].c, crypt_key2[i].w, NULL, SSEi_MIXED_IN);
+				SIMDmd4body(input_buf[i].c, crypt_key2[i].w, NULL, SSEi_MIXED_IN);
 			}
 		} else {
 			for (; i < til; i += SIMD_PARA_MD4) {
-				SSE_Intrinsics_LoadLens(0, i);
-				SSEmd4body(input_buf[i].c, crypt_key2[i].w, NULL, SSEi_MIXED_IN);
+				SSE_Intrinsics_LoadLens_md4(0, i);
+				SIMDmd4body(input_buf[i].c, crypt_key2[i].w, NULL, SSEi_MIXED_IN);
 			}
 		}
 		return;
@@ -5320,8 +5215,8 @@ void DynamicFunc__crypt_md5_in2_to_out1(DYNA_OMP_PARAMS)
 		i /= SIMD_COEF_32;
 		for (; i < til; i += SIMD_PARA_MD5)
 		{
-			SSE_Intrinsics_LoadLens(1, i);
-			SSEmd5body(input_buf2[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
+			SSE_Intrinsics_LoadLens_md5(1, i);
+			SIMDmd5body(input_buf2[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
 			//dump_stuff_mmx_msg("DynamicFunc__crypt_md5_in2_to_out1", input_buf2[i].c,64,m_count-1);
 		}
 		return;
@@ -5358,8 +5253,8 @@ void DynamicFunc__crypt_md4_in2_to_out1(DYNA_OMP_PARAMS)
 		i /= SIMD_COEF_32;
 		for (; i < til; i += SIMD_PARA_MD4)
 		{
-			SSE_Intrinsics_LoadLens(1, i);
-			SSEmd4body(input_buf2[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
+			SSE_Intrinsics_LoadLens_md4(1, i);
+			SIMDmd4body(input_buf2[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
 		}
 		return;
 	}
@@ -5398,11 +5293,11 @@ void DynamicFunc__crypt_md5_to_input_raw(DYNA_OMP_PARAMS)
 		for (; i < til; i += SIMD_PARA_MD5)
 		{
 			unsigned int j, k;
-			SSE_Intrinsics_LoadLens(0, i);
+			SSE_Intrinsics_LoadLens_md5(0, i);
 			// NOTE, since crypt_key array is 16 bytes each, and input_buf is 64 bytes
 			// each, and we are doing 3 at a time, we can NOT directly write to the
 			// input buff, but have to use the crypt_key buffer, and then memcpy when done.
-			SSEmd5body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
+			SIMDmd5body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
 			for (j = 0; j < SIMD_PARA_MD5; ++j)
 			{
 				memset(input_buf[i+j].c, 0, sizeof(input_buf[0]));
@@ -5448,11 +5343,11 @@ void DynamicFunc__crypt_md5_to_input_raw_Overwrite_NoLen_but_setlen_in_SSE(DYNA_
 		for (; i < til; i += SIMD_PARA_MD5)
 		{
 			unsigned int j;
-			SSE_Intrinsics_LoadLens(0, i);
+			SSE_Intrinsics_LoadLens_md5(0, i);
 			// NOTE, since crypt_key array is 16 bytes each, and input_buf is 64 bytes
 			// each, and we are doing 3 at a time, we can NOT directly write to the
 			// input buff, but have to use the crypt_key buffer, and then memcpy when done.
-			SSEmd5body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
+			SIMDmd5body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
 			for (j = 0; j < SIMD_PARA_MD5; ++j)
 				memcpy(input_buf[i+j].c, crypt_key[i+j].c, 16*SIMD_COEF_32);
 		}
@@ -5494,7 +5389,7 @@ void DynamicFunc__crypt_md5_to_input_raw_Overwrite_NoLen(DYNA_OMP_PARAMS)
 			// NOTE, since crypt_key array is 16 bytes each, and input_buf is 64 bytes
 			// each, and we are doing 3 at a time, we can NOT directly write to the
 			// input buff, but have to use the crypt_key buffer, and then memcpy when done.
-			SSEmd5body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
+			SIMDmd5body(input_buf[i].c, crypt_key[i].w, NULL, SSEi_MIXED_IN);
 			for (j = 0; j < SIMD_PARA_MD5; ++j)
 				memcpy(input_buf[i+j].c, crypt_key[i+j].c, 16*SIMD_COEF_32);
 		}
@@ -6977,7 +6872,6 @@ void DynamicFunc__base16_convert_upcase(DYNA_OMP_PARAMS)
  * add the proper flags, even if the user is running an older
  * script.
  *************************************************************/
-void DynamicFunc__PHPassSetup(DYNA_OMP_PARAMS) {}
 void DynamicFunc__InitialLoadKeysToInput(DYNA_OMP_PARAMS) {}
 void DynamicFunc__InitialLoadKeys_md5crypt_ToOutput2(DYNA_OMP_PARAMS) {}
 void DynamicFunc__InitialLoadKeys_md5crypt_ToOutput2_Base16_to_Input1(DYNA_OMP_PARAMS) {}
@@ -6999,8 +6893,7 @@ static DYNAMIC_primitive_funcp *ConvertFuncs(DYNAMIC_primitive_funcp p, unsigned
 {
 	static DYNAMIC_primitive_funcp fncs[20];
 	*count = 0;
-	if (p==DynamicFunc__PHPassSetup  ||
-		p==DynamicFunc__InitialLoadKeysToInput ||
+	if (p==DynamicFunc__InitialLoadKeysToInput ||
 		p==DynamicFunc__InitialLoadKeys_md5crypt_ToOutput2 ||
 		p==DynamicFunc__InitialLoadKeys_md5crypt_ToOutput2_Base16_to_Input1 ||
 		p==DynamicFunc__InitialLoadKeys_md5crypt_ToOutput2_Base16_to_Input1_offset32)
@@ -7094,9 +6987,6 @@ static int isMD5Func(DYNAMIC_primitive_funcp p)
 		p==DynamicFunc__crypt_md5_in2_to_out1    || p==DynamicFunc__crypt_md5_to_input_raw_Overwrite_NoLen_but_setlen_in_SSE ||
 		p==DynamicFunc__crypt2_md5               || p==DynamicFunc__InitialLoadKeys_md5crypt_ToOutput2_Base16_to_Input1_offset32)
 		return 1;
-	// this one also.
-	if (p==DynamicFunc__PHPassCrypt)
-		return 1;
 	return 0;
 }
 #endif
@@ -7152,6 +7042,12 @@ static int isSKEINFunc(DYNAMIC_primitive_funcp p) {
 	RETURN_TRUE_IF_BIG_FUNC(SKEIN384); RETURN_TRUE_IF_BIG_FUNC(SKEIN512);
 	return 0;
 }
+static int isKECCAKFunc(DYNAMIC_primitive_funcp p) {
+	RETURN_TRUE_IF_BIG_FUNC(SHA3_224); RETURN_TRUE_IF_BIG_FUNC(SHA3_256); RETURN_TRUE_IF_BIG_FUNC(SHA3_384);
+    RETURN_TRUE_IF_BIG_FUNC(SHA3_512); RETURN_TRUE_IF_BIG_FUNC(KECCAK_256); RETURN_TRUE_IF_BIG_FUNC(KECCAK_512);
+	return 0;
+}
+// LARGE_HASH_EDIT_POINT  (Add a new IsXXXFunc() type function)
 
 static int isLargeHashFinalFunc(DYNAMIC_primitive_funcp p)
 {
@@ -7163,7 +7059,9 @@ static int isLargeHashFinalFunc(DYNAMIC_primitive_funcp p)
 		IF(HAVAL128_3)||IF(HAVAL128_4)||IF(HAVAL128_5)||IF(HAVAL160_3)||IF(HAVAL160_4)||IF(HAVAL160_5)||
 		IF(HAVAL192_3)||IF(HAVAL192_4)||IF(HAVAL192_5)||IF(HAVAL224_3)||IF(HAVAL224_4)||IF(HAVAL224_5)||
 		IF(HAVAL256_3)||IF(HAVAL256_4)||IF(HAVAL256_5)||IF(MD2)||IF(PANAMA)||IF(SKEIN224)||IF(SKEIN256)||
-		IF(SKEIN384)||IF(SKEIN512))
+		IF(SKEIN384)||IF(SKEIN512)||IF(SHA3_224)||IF(SHA3_256)||IF(SHA3_384)||IF(SHA3_512)||
+		IF(KECCAK_256)||IF(KECCAK_512))
+		// LARGE_HASH_EDIT_POINT
 		return 1;
 	return 0;
 }
@@ -7254,8 +7152,6 @@ int dynamic_SETUP(DYNAMIC_Setup *Setup, struct fmt_main *pFmt)
 	}
 
 	// Deal with depricated 1st functions.  Convert them to proper 'flags'
-	if (Setup->pFuncs[0] == DynamicFunc__PHPassSetup)
-		Setup->startFlags |= MGF_PHPassSetup;
 	if (Setup->pFuncs[0] == DynamicFunc__InitialLoadKeysToInput)
 		Setup->startFlags |= MGF_KEYS_INPUT;
 	if (Setup->pFuncs[0] == DynamicFunc__InitialLoadKeys_md5crypt_ToOutput2)
@@ -7518,63 +7414,34 @@ int dynamic_SETUP(DYNAMIC_Setup *Setup, struct fmt_main *pFmt)
 	if (curdat.store_keys_in_input_unicode_convert && curdat.store_keys_in_input)
 		return !fprintf(stderr, "Error invalid format %s: Using MGF_KEYS_INPUT and MGF_KEYS_UNICODE_B4_CRYPT in same format is NOT valid\n", Setup->szFORMAT_NAME);
 
-	curdat.store_keys_normal_but_precompute_md5_to_output2 = !!(Setup->startFlags&MGF_KEYS_CRYPT_IN2);
+	curdat.store_keys_normal_but_precompute_hash_to_output2 = !!(Setup->startFlags&MGF_KEYS_CRYPT_IN2);
 
-	curdat.store_keys_normal_but_precompute_md5_to_output2_base16_to_input1 = !!(Setup->startFlags&(MGF_KEYS_BASE16_IN1|MGF_KEYS_BASE16_IN1_SHA1|MGF_KEYS_BASE16_IN1_SHA256));
+	curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1 = !!(Setup->startFlags&MGF_KEYS_BASE16_IN1);
 
-	if (curdat.store_keys_normal_but_precompute_md5_to_output2_base16_to_input1)
-		curdat.store_keys_normal_but_precompute_md5_to_output2 = 1;
+	if (curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1)
+		curdat.store_keys_normal_but_precompute_hash_to_output2 = 1;
 
-	curdat.store_keys_normal_but_precompute_md5_to_output2_base16_to_input1_offset32 = !!(Setup->startFlags&MGF_KEYS_BASE16_IN1_Offset32);
-	if (curdat.store_keys_normal_but_precompute_md5_to_output2_base16_to_input1_offset32)
+#define IF_CDOFF32(F,L) if (!curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1_offsetX) \
+	curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1_offsetX = (!!(Setup->startFlags&MGF_KEYS_BASE16_IN1_Offset_ ## F))*L
+
+	curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1_offsetX = 0;
+	IF_CDOFF32(MD5,32); IF_CDOFF32(MD4,32); IF_CDOFF32(SHA1,40); IF_CDOFF32(SHA224,56);
+	IF_CDOFF32(SHA256,64); IF_CDOFF32(SHA384,96); IF_CDOFF32(SHA512,128); IF_CDOFF32(GOST,64);
+	IF_CDOFF32(WHIRLPOOL,128); IF_CDOFF32(Tiger,48); IF_CDOFF32(RIPEMD128,32); IF_CDOFF32(RIPEMD160,40);
+	IF_CDOFF32(RIPEMD256,64); IF_CDOFF32(RIPEMD320,80); IF_CDOFF32(MD2,32); IF_CDOFF32(PANAMA,64);
+	IF_CDOFF32(HAVAL128_3,32); IF_CDOFF32(HAVAL160_3,40); IF_CDOFF32(HAVAL192_3,48); IF_CDOFF32(HAVAL224_3,56); IF_CDOFF32(HAVAL256_3,64);
+	IF_CDOFF32(HAVAL128_4,32); IF_CDOFF32(HAVAL160_4,40); IF_CDOFF32(HAVAL192_4,48); IF_CDOFF32(HAVAL224_4,56); IF_CDOFF32(HAVAL256_4,64);
+	IF_CDOFF32(HAVAL128_5,32); IF_CDOFF32(HAVAL160_5,40); IF_CDOFF32(HAVAL192_5,48); IF_CDOFF32(HAVAL224_5,56); IF_CDOFF32(HAVAL256_5,64);
+	IF_CDOFF32(SKEIN224,56); IF_CDOFF32(SKEIN256,64); IF_CDOFF32(SKEIN384,96); IF_CDOFF32(SKEIN512,128);
+	IF_CDOFF32(SHA3_224,56); IF_CDOFF32(SHA3_256,64); IF_CDOFF32(SHA3_384,96); IF_CDOFF32(SHA3_512,128);
+	IF_CDOFF32(KECCAK_256,64); IF_CDOFF32(KECCAK_512,128);
+	// LARGE_HASH_EDIT_POINT
+
+	if (curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1_offsetX)
 	{
-		curdat.store_keys_normal_but_precompute_md5_to_output2 = 1;
+		curdat.store_keys_normal_but_precompute_hash_to_output2 = 1;
 	}
-	curdat.store_keys_normal_but_precompute_md5_to_output2_base16_type = Setup->startFlags>>56;
-
-	if (Setup->startFlags&MGF_PHPassSetup)
-	{
-		pFmt->methods.salt = salt_phpass;
-#ifdef _OPENMP
-#ifdef SIMD_COEF_32
-		// no reason to do 128 crypts, causes slow validity checking.  But we do get some gains
-		// by doing more than simple 1 set of SIMD_COEF_32
-		pFmt->params.algorithm_name = "128/128 " SIMD_TYPE " " STRINGIZE(SIMD_COEF_32) "x" STRINGIZE(SIMD_PARA_MD5);
-		pFmt->params.max_keys_per_crypt = 96*SIMD_PARA_MD5;
-#else
-#if ARCH_LITTLE_ENDIAN
-		pFmt->params.max_keys_per_crypt = 96;
-#else
-		pFmt->params.max_keys_per_crypt = 2;
-#endif
-#if MD5_X2
-		pFmt->params.algorithm_name = "32/" ARCH_BITS_STR " 48x2  (MD5_body)";
-#else
-		pFmt->params.algorithm_name = "32/" ARCH_BITS_STR " 96x1 (MD5_body)";
-#endif
-#endif
-#else
-#ifdef SIMD_COEF_32
-		pFmt->params.algorithm_name = "128/128 " SIMD_TYPE " " STRINGIZE(SIMD_COEF_32) "x" STRINGIZE(SIMD_PARA_MD5);
-		pFmt->params.max_keys_per_crypt = 16*SIMD_PARA_MD5;
-#else
-		// In non-sse mode, 1 test runs as fast as 128. But validity checking is MUCH faster if
-		// we leave it at only 1.
-		pFmt->params.max_keys_per_crypt = 1;
-#if MD5_X2
-		pFmt->params.max_keys_per_crypt = 2;
-		pFmt->params.algorithm_name = "32/" ARCH_BITS_STR " 1x2  (MD5_body)";
-#else
-		pFmt->params.algorithm_name = "32/" ARCH_BITS_STR " (MD5_body)";
-#endif
-#endif
-#endif
-		pFmt->params.min_keys_per_crypt = 1;
-		saltlen = 8;
-		// no reason to run double tests. The 1 salt vs MANY salts is the
-		// same speed, so why double the benchmark time for no reason.
-		pFmt->params.benchmark_length = -1;
-	}
+	curdat.store_keys_normal_but_precompute_hash_to_output2_base16_type = Setup->startFlags>>56;
 
 	if ((Setup->startFlags) == 0)
 	{
@@ -7622,17 +7489,25 @@ int dynamic_SETUP(DYNAMIC_Setup *Setup, struct fmt_main *pFmt)
 		//
 		// But for now, just get it working.  Get it working faster later.
 
+		// NOTE, these are commented out now. I am not sure why they were there
+		// I think the thought was for SIMD, BUT SIMD is not used on Sparc
+		// I am leaving this code for now, BUT I think it should NOT be here.
+		// I was getting failures on the 16 byte sph formats, for any
+		// hash(hash($p).$s)  such as md2(md2($p).$s)  However, the modifications
+		// where curdat.store_keys_in_input==1 is absolutely needed, or we have
+		// get_key() failures all over the place.
+
 		// note, with Setup->pFuncs[0]==DynamicFunc__set_input_len_32, we only will handle type 6 and 7
 		// for now we have this 'turned' off.  It is fixed for type 6, 7 and 14.  It is left on for the
 		// john.ini stuff.  Thus, if someone builds the intel version type 6, it will work (but slower).
-		if (curdat.store_keys_normal_but_precompute_md5_to_output2_base16_to_input1==1 && Setup->pFuncs[0]==DynamicFunc__set_input_len_32) {
-			curdat.store_keys_normal_but_precompute_md5_to_output2_base16_to_input1 = 0;
-			curdat.dynamic_FUNCTIONS[j++] = DynamicFunc__clean_input;
-			curdat.dynamic_FUNCTIONS[j++] = DynamicFunc__append_keys;
-			curdat.dynamic_FUNCTIONS[j++] = DynamicFunc__crypt_md5;
-			curdat.dynamic_FUNCTIONS[j++] = DynamicFunc__clean_input;
-			Setup->pFuncs[0] = DynamicFunc__append_from_last_output_as_base16;
-		}
+//		if (curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1==1 && Setup->pFuncs[0]==DynamicFunc__set_input_len_32) {
+//			curdat.store_keys_normal_but_precompute_hash_to_output2_base16_to_input1 = 0;
+//			curdat.dynamic_FUNCTIONS[j++] = DynamicFunc__clean_input;
+//			curdat.dynamic_FUNCTIONS[j++] = DynamicFunc__append_keys;
+//			curdat.dynamic_FUNCTIONS[j++] = DynamicFunc__crypt_md5;
+//			curdat.dynamic_FUNCTIONS[j++] = DynamicFunc__clean_input;
+//			Setup->pFuncs[0] = DynamicFunc__append_from_last_output_as_base16;
+//		}
 #endif
 		for (i=0; Setup->pFuncs[i]; ++i)
 		{
@@ -7729,6 +7604,16 @@ int dynamic_SETUP(DYNAMIC_Setup *Setup, struct fmt_main *pFmt)
 				IS_FUNC_NAME(MD2,MD2)
 				IS_FUNC_NAME(PANAMA,PANAMA)
 				IS_FUNC_NAME(SKEIN,SKEIN)
+
+				// Note, until we add SIMD keccak, one algoithm is all we 'need'
+				IS_FUNC_NAME(KECCAK,KECCAK)
+//				IS_FUNC_NAME(KECCAK,SHA3_256)
+//				IS_FUNC_NAME(KECCAK,SHA3_384)
+//				IS_FUNC_NAME(KECCAK,SHA3_512)
+//				IS_FUNC_NAME(KECCAK,KECCAK_256)
+//				IS_FUNC_NAME(KECCAK,KECCAK_512)
+
+				// LARGE_HASH_EDIT_POINT  (MUST match the just added a new IsXXXFunc() type function)
 			}
 			if (isLargeHashFinalFunc(curdat.dynamic_FUNCTIONS[j-1]))
 			{
@@ -7755,10 +7640,6 @@ int dynamic_SETUP(DYNAMIC_Setup *Setup, struct fmt_main *pFmt)
 		for (i = 0; cnt < ARRAY_COUNT(dynamic_tests) -1; ++i)
 		{
 			if (Setup->pPreloads[i].ciphertext == NULL) {
-				if (Setup->startFlags&MGF_PHPassSetup)
-					// for phpass, do not load ANY more than the 9 that are in the preload.
-					// loading more will simply slow down the validation code loop at startup.
-					break;
 				i = 0;
 			}
 			if (Setup->pPreloads[i].ciphertext[0] == 'A' && Setup->pPreloads[i].ciphertext[1] == '=') {
@@ -7799,6 +7680,9 @@ int dynamic_SETUP(DYNAMIC_Setup *Setup, struct fmt_main *pFmt)
 		sprintf(s, "%s %s", cp, pFmt->params.algorithm_name);
 		pFmt->params.algorithm_name = str_alloc_copy(s);
 	}
+
+	if ((Setup->flags & MGF_SALTED) && !Setup->SaltLen)
+		return !fprintf(stderr, "Error invalid format %s\n\tIt is required to add SaltLen= to the script, for this format\n", Setup->szFORMAT_NAME);
 	return 1;
 }
 
@@ -7807,7 +7691,15 @@ static int LoadOneFormat(int idx, struct fmt_main *pFmt)
 	extern struct options_main options;
 	char label[16] = { 0 }, label_id[16] = { 0 }, *cp = NULL;
 	memcpy(pFmt, &fmt_Dynamic, sizeof(struct fmt_main));
-	dynamic_RESET(pFmt);
+
+	// TODO:
+	// NOTE, this was commented out, because the late binding @dynamic=expr@
+	// hashes were killing out possibly pre-setup input buffers.  NOTE, that
+	// things worked fine after this, all self tests do pass, and I am 99%
+	// sure that all of this 'required' cleaning happens in init(). but I am
+	// putting this comment in here, so that if at a later time, there are
+	// problems and are tracked down to this, we will know why.
+//	dynamic_RESET(pFmt);
 
 	// Ok we need to list this as a dynamic format (even for the 'thin' formats)
 	pFmt->params.flags |= FMT_DYNAMIC;
@@ -7899,7 +7791,7 @@ struct fmt_main *dynamic_Register_local_format(int *type) {
 
 int dynamic_Register_formats(struct fmt_main **ptr)
 {
-	int count, i, idx, single=-1, wildcard = 0;
+	int count, i, idx, single=-1, wildcard = 0, pop[5000];
 	extern struct options_main options;
 
 	if (options.format && strstr(options.format, "*"))
@@ -7929,13 +7821,14 @@ int dynamic_Register_formats(struct fmt_main **ptr)
 	}
 
 	for (count = i = 0; i < 5000; ++i) {
-		if (dynamic_IS_VALID(i, 1) == 1)
+		if ((pop[i] = (dynamic_IS_VALID(i, 0) == 1)))
 			++count;
 	}
+
 	// Ok, now we know how many formats we have.  Load them
 	pFmts = mem_alloc_tiny(sizeof(pFmts[0])*count, MEM_ALIGN_WORD);
 	for (idx = i = 0; i < 5000; ++i) {
-		if (dynamic_IS_VALID(i, 1) == 1) {
+		if (pop[i]) {
 			if (LoadOneFormat(i, &pFmts[idx]) == 0)
 				--count;
 			else
@@ -8016,23 +7909,14 @@ struct fmt_main *dynamic_THIN_FORMAT_LINK(struct fmt_main *pFmt, char *ciphertex
 
 	nFmtNum = -1;
 	sscanf(subformat, "$dynamic_%d", &nFmtNum);
-	if (nFmtNum == -1) {
-		fprintf(stderr, "Error, Invalid signature line trying to link to dynamic format.\nOriginal format=%s\nSignature line=%s\n", orig_sig, ciphertext);
-		error();
-	}
-
+	if (nFmtNum == -1)
+		error_msg("Error, Invalid signature line trying to link to dynamic format.\nOriginal format=%s\nSignature line=%s\n", orig_sig, ciphertext);
 	pFmtLocal = dynamic_Get_fmt_main(nFmtNum);
-	if (pFmtLocal == NULL) {
-		fprintf(stderr, "Error, Invalid signature line trying to link to dynamic format.\nOriginal format=%s\nSignature line=%s\n", orig_sig, ciphertext);
-		error();
-	}
-
+	if (pFmtLocal == NULL)
+		error_msg("Error, Invalid signature line trying to link to dynamic format.\nOriginal format=%s\nSignature line=%s\n", orig_sig, ciphertext);
 	valid = pFmtLocal->methods.valid(ciphertext, pFmtLocal);
-	if (!valid) {
-		fprintf(stderr, "Error, trying to link to %s using ciphertext=%s FAILED\n", subformat, ciphertext);
-		error();
-	}
-
+	if (!valid)
+		error_msg("Error, trying to link to %s using ciphertext=%s FAILED\n", subformat, ciphertext);
 	pFmt->params.algorithm_name = pFmtLocal->params.algorithm_name;
 	if (pFmt->params.plaintext_length == 0 ||
 		pFmt->params.plaintext_length > pFmtLocal->params.plaintext_length) {
@@ -8049,12 +7933,10 @@ struct fmt_main *dynamic_THIN_FORMAT_LINK(struct fmt_main *pFmt, char *ciphertex
 	pFmt->methods.cmp_all    = pFmtLocal->methods.cmp_all;
 	pFmt->methods.cmp_one    = pFmtLocal->methods.cmp_one;
 	pFmt->methods.cmp_exact  = pFmtLocal->methods.cmp_exact;
-#if FMT_MAIN_VERSION > 11
 	for (i = 0; i < FMT_TUNABLE_COSTS; ++i) {
 		pFmt->methods.tunable_cost_value[i] = pFmtLocal->methods.tunable_cost_value[i];
 		pFmt->params.tunable_cost_name[i] = pFmtLocal->params.tunable_cost_name[i];
 	}
-#endif
 	pFmt->methods.source     = pFmtLocal->methods.source;
 	pFmt->methods.set_salt   = pFmtLocal->methods.set_salt;
 	pFmt->methods.salt       = pFmtLocal->methods.salt;

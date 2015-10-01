@@ -28,7 +28,7 @@ john_register_one(&fmt_drupal7);
 #include "common.h"
 #include "formats.h"
 #include "johnswap.h"
-#include "sse-intrinsics.h"
+#include "simd-intrinsics.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -197,7 +197,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			keys[GETPOS(j+8, i)] = 0x80;
 			keys64[15*SIMD_COEF_64+(i&(SIMD_COEF_64-1))+i/SIMD_COEF_64*SHA_BUF_SIZ*SIMD_COEF_64] = (len+8) << 3;
 		}
-		SSESHA512body(keys, keys64, NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT);
+		SIMDSHA512body(keys, keys64, NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT);
 		for (i = 0; i < MAX_KEYS_PER_CRYPT; ++i) {
 			len = EncKeyLen[index+i];
 			for (j = 0; j < len; ++j)
@@ -206,10 +206,10 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			keys64[15*SIMD_COEF_64+(i&(SIMD_COEF_64-1))+i/SIMD_COEF_64*SHA_BUF_SIZ*SIMD_COEF_64] = (len+64) << 3;
 		}
 		while (--Lcount)
-			SSESHA512body(keys, keys64, NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT);
+			SIMDSHA512body(keys, keys64, NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT);
 
 		// Last one with FLAT_OUT
-		SSESHA512body(keys, (ARCH_WORD_64*)crypt_key[index], NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT|SSEi_FLAT_OUT);
+		SIMDSHA512body(keys, (ARCH_WORD_64*)crypt_key[index], NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT|SSEi_FLAT_OUT);
 #else
 		SHA512_CTX ctx;
 		unsigned char tmp[DIGEST_SIZE + PLAINTEXT_LENGTH];
@@ -286,25 +286,23 @@ static void * get_salt(char *ciphertext)
 	return salt.u8;
 }
 
-static int get_hash_0(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0xf; }
-static int get_hash_1(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0xff; }
-static int get_hash_2(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0xfff; }
-static int get_hash_3(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0xffff; }
-static int get_hash_4(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0xfffff; }
-static int get_hash_5(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0xffffff; }
-static int get_hash_6(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0x7ffffff; }
+static int get_hash_0(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_0; }
+static int get_hash_1(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_1; }
+static int get_hash_2(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_2; }
+static int get_hash_3(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_3; }
+static int get_hash_4(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_4; }
+static int get_hash_5(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_5; }
+static int get_hash_6(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_6; }
 
 static int salt_hash(void *salt)
 {
 	return *((ARCH_WORD_32 *)salt) & 0x3FF;
 }
 
-#if FMT_MAIN_VERSION > 11
 static unsigned int iteration_count(void *salt)
 {
 	return (unsigned int) 1 << (atoi64[ARCH_INDEX(((char*)salt)[8])]);
 }
-#endif
 struct fmt_main fmt_drupal7 = {
 	{
 		FORMAT_LABEL,
@@ -322,11 +320,9 @@ struct fmt_main fmt_drupal7 = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
 		{
 			"iteration count",
 		},
-#endif
 		tests
 	}, {
 		init,
@@ -337,11 +333,9 @@ struct fmt_main fmt_drupal7 = {
 		fmt_default_split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{
 			iteration_count,
 		},
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,

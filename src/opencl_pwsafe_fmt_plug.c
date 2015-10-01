@@ -70,23 +70,10 @@ static size_t get_task_max_work_group_size()
 		autotune_get_task_max_work_group_size(FALSE, 0, finish_kernel));
 }
 
-static size_t get_task_max_size()
-{
-	return 0;
-}
-
-static size_t get_default_workgroup()
-{
-	return 0;
-}
-
 # define SWAP32(n) \
     (((n) << 24) | (((n) & 0xff00) << 8) | (((n) >> 8) & 0xff00) | ((n) >> 24))
 
 static int split_events[3] = { 2, -1, -1 };
-
-static int crypt_all(int *pcount, struct db_salt *_salt);
-static int crypt_all_benchmark(int *pcount, struct db_salt *_salt);
 
 static struct fmt_tests pwsafe_tests[] = {
 	{"$pwsafe$*3*fefc1172093344c9d5577b25f5b4b6e5d2942c94f9fc24c21733e28ae6527521*2048*88cbaf7d8668c1a98263f5dce7cb39c3304c49a3e0d76a7ea475dc02ab2f97a7", "12345678"},
@@ -141,12 +128,16 @@ static void release_clobj(void)
 
 static void done(void)
 {
-	release_clobj();
+	if (autotuned) {
+		release_clobj();
 
-	HANDLE_CLERROR(clReleaseKernel(init_kernel), "Release kernel");
-	HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel");
-	HANDLE_CLERROR(clReleaseKernel(finish_kernel), "Release kernel");
-	HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
+		HANDLE_CLERROR(clReleaseKernel(init_kernel), "Release kernel");
+		HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel");
+		HANDLE_CLERROR(clReleaseKernel(finish_kernel), "Release kernel");
+		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
+
+		autotuned--;
+	}
 }
 
 static void pwsafe_set_key(char *key, int index)
@@ -191,24 +182,24 @@ static void create_clobj(size_t gws, struct fmt_main *self)
 static void init(struct fmt_main *_self)
 {
 	self = _self;
-
-	opencl_init("$JOHN/kernels/pwsafe_kernel.cl", gpu_id, NULL);
-
-	init_kernel = clCreateKernel(program[gpu_id], KERNEL_INIT_NAME, &ret_code);
-	HANDLE_CLERROR(ret_code, "Error while creating init kernel");
-
-	crypt_kernel = clCreateKernel(program[gpu_id], KERNEL_RUN_NAME, &ret_code);
-	HANDLE_CLERROR(ret_code, "Error while creating crypt kernel");
-
-	finish_kernel = clCreateKernel(program[gpu_id], KERNEL_FINISH_NAME, &ret_code);
-	HANDLE_CLERROR(ret_code, "Error while creating finish kernel");
+	opencl_prepare_dev(gpu_id);
 }
 
 static void reset(struct db_main *db)
 {
 	if (!autotuned) {
+		opencl_init("$JOHN/kernels/pwsafe_kernel.cl", gpu_id, NULL);
+
+		init_kernel = clCreateKernel(program[gpu_id], KERNEL_INIT_NAME, &ret_code);
+		HANDLE_CLERROR(ret_code, "Error while creating init kernel");
+
+		crypt_kernel = clCreateKernel(program[gpu_id], KERNEL_RUN_NAME, &ret_code);
+		HANDLE_CLERROR(ret_code, "Error while creating crypt kernel");
+
+		finish_kernel = clCreateKernel(program[gpu_id], KERNEL_FINISH_NAME, &ret_code);
+		HANDLE_CLERROR(ret_code, "Error while creating finish kernel");
+
 		//Initialize openCL tuning (library) for this format.
-		self->methods.crypt_all = crypt_all_benchmark;
 		opencl_init_auto_setup(SEED, ROUNDS_DEFAULT/8, split_events,
 		                       warn, 2, self, create_clobj,
 		                       release_clobj, sizeof(pwsafe_pass), 0);
@@ -217,7 +208,6 @@ static void reset(struct db_main *db)
 		autotune_run(self, ROUNDS_DEFAULT, 0,
 		             (cpu(device_info[gpu_id]) ?
 		              500000000ULL : 1000000000ULL));
-		self->methods.crypt_all = crypt_all;
 	}
 }
 
@@ -236,25 +226,25 @@ static int valid(char *ciphertext, struct fmt_main *self)
 		goto err;
 	if (!isdec(p))
 		goto err;
-	if (atoi(p) <= 0)
+	if (!atoi(p))
 		goto err;
 	if ((p = strtokm(NULL, "*")) == NULL)	/* salt */
 		goto err;
 	if (strlen(p) < 64)
 		goto err;
-	if (strspn(p, "0123456789abcdef") != 64)
+	if (strspn(p, HEXCHARS_lc) != 64)
 		goto err;
 	if ((p = strtokm(NULL, "*")) == NULL)	/* iterations */
 		goto err;
 	if (!isdec(p))
 		goto err;
-	if (atoi(p) <= 0)
+	if (!atoi(p))
 		goto err;
 	if ((p = strtokm(NULL, "*")) == NULL)	/* hash */
 		goto err;
 	if (strlen(p) != 64)
 		goto err;
-	if (strspn(p, "0123456789abcdef") != 64)
+	if (strspn(p, HEXCHARS_lc) != 64)
 		goto err;
 	MEM_FREE(keeptr);
 	return 1;
@@ -302,75 +292,40 @@ static void set_salt(void *salt)
 	        "Copy memsalt");
 }
 
-static int crypt_all_benchmark(int *pcount, struct db_salt *salt)
+static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
+	const int count = *pcount;
+	int i = 0;
 	size_t *lws = local_work_size ? &local_work_size : NULL;
 
-	BENCH_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_in, CL_FALSE,
-		0, insize, host_pass, 0, NULL, multi_profilingEvent[0]), "Copy memin");
+	global_work_size = GET_MULTIPLE_OR_BIGGER(count, local_work_size);
 
-	///Run the init kernel
-	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], init_kernel, 1,
-		NULL, &global_work_size, lws,
+	///Copy data to GPU memory
+		BENCH_CLERROR(clEnqueueWriteBuffer
+			(queue[gpu_id], mem_in, CL_FALSE, 0, insize, host_pass, 0, NULL,
+			multi_profilingEvent[0]), "Copy memin");
+
+	BENCH_CLERROR(clEnqueueNDRangeKernel
+	    (queue[gpu_id], init_kernel, 1, NULL, &global_work_size, lws,
 		0, NULL, multi_profilingEvent[1]), "Set ND range");
 
-	///Run split kernel
-	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], crypt_kernel, 1,
-		NULL, &global_work_size, lws,
-		0, NULL, NULL), "Set ND range");
-	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], crypt_kernel, 1,
-		NULL, &global_work_size, lws,
-		0, NULL, multi_profilingEvent[2]), "Set ND range");
+	///Run kernel
+	for(i = 0; i < (ocl_autotune_running ? 1 : 8); i++)
+	{
+		BENCH_CLERROR(clEnqueueNDRangeKernel
+			(queue[gpu_id], crypt_kernel, 1, NULL, &global_work_size, lws,
+			0, NULL, multi_profilingEvent[2]), "Set ND range");
+		BENCH_CLERROR(clFinish(queue[gpu_id]), "Error running loop kernel");
+		opencl_process_event();
+	}
 
-	///Run the finish kernel
-	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], finish_kernel, 1,
-		NULL, &global_work_size, lws,
+	BENCH_CLERROR(clEnqueueNDRangeKernel
+	    (queue[gpu_id], finish_kernel, 1, NULL, &global_work_size, lws,
 		0, NULL, multi_profilingEvent[3]), "Set ND range");
 
 	BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_out, CL_TRUE, 0,
 		outsize, host_hash, 0, NULL, multi_profilingEvent[4]),
 	    "Copy data back");
-
-	return count;
-}
-
-static int crypt_all(int *pcount, struct db_salt *salt)
-{
-	const int count = *pcount;
-	int i = 0;
-
-	global_work_size = (count + local_work_size - 1) / local_work_size * local_work_size;
-
-	///Copy data to GPU memory
-		HANDLE_CLERROR(clEnqueueWriteBuffer
-			(queue[gpu_id], mem_in, CL_FALSE, 0, insize, host_pass, 0, NULL,
-			NULL), "Copy memin");
-
-	HANDLE_CLERROR(clEnqueueNDRangeKernel
-	    (queue[gpu_id], init_kernel, 1, NULL, &global_work_size, &local_work_size,
-		0, NULL, NULL), "Set ND range");
-
-	///Run kernel
-	for(i = 0; i < 8; i++)
-	{
-		HANDLE_CLERROR(clEnqueueNDRangeKernel
-			(queue[gpu_id], crypt_kernel, 1, NULL, &global_work_size, &local_work_size,
-			0, NULL, NULL), "Set ND range");
-		HANDLE_CLERROR(clFinish(queue[gpu_id]), "Error running loop kernel");
-		opencl_process_event();
-	}
-
-	HANDLE_CLERROR(clEnqueueNDRangeKernel
-	    (queue[gpu_id], finish_kernel, 1, NULL, &global_work_size, &local_work_size,
-		0, NULL, NULL), "Set ND range");
-
-	HANDLE_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_out, CL_FALSE, 0,
-		outsize, host_hash, 0, NULL, NULL),
-	    "Copy data back");
-
-	///Await completion of all the above
-	HANDLE_CLERROR(clFinish(queue[gpu_id]), "clFinish error");
 
 	return count;
 }
@@ -404,7 +359,6 @@ static char *get_key(int index)
 	return ret;
 }
 
-#if FMT_MAIN_VERSION > 11
 	static unsigned int iteration_count(void *salt)
 	{
 		pwsafe_salt *my_salt;
@@ -412,7 +366,6 @@ static char *get_key(int index)
 		my_salt = salt;
 		return (unsigned int) my_salt->iterations;
 	}
-#endif
 
 struct fmt_main fmt_opencl_pwsafe = {
 	{
@@ -430,11 +383,9 @@ struct fmt_main fmt_opencl_pwsafe = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT,
-#if FMT_MAIN_VERSION > 11
 		{
 			"iteration count",
 		},
-#endif
 		pwsafe_tests
 	}, {
 		init,
@@ -445,11 +396,9 @@ struct fmt_main fmt_opencl_pwsafe = {
 		fmt_default_split,
 		fmt_default_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{
 			iteration_count,
 		},
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash

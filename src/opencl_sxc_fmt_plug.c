@@ -17,7 +17,7 @@ john_register_one(&fmt_opencl_sxc);
 #include <string.h>
 #include "sha.h"
 #include <openssl/blowfish.h>
-#include <openssl/aes.h>
+#include "aes.h"
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -114,20 +114,6 @@ static size_t get_task_max_work_group_size()
 	return autotune_get_task_max_work_group_size(FALSE, 0, crypt_kernel);
 }
 
-static size_t get_task_max_size()
-{
-	return 0;
-}
-
-static size_t get_default_workgroup()
-{
-	if (cpu(device_info[gpu_id]))
-		return get_platform_vendor_id(platform_id) == DEV_INTEL ?
-			8 : 1;
-	else
-		return 64;
-}
-
 static void create_clobj(size_t gws, struct fmt_main *self)
 {
 	insize = sizeof(sxc_password) * gws;
@@ -177,33 +163,38 @@ static void release_clobj(void)
 
 static void done(void)
 {
-	release_clobj();
+	if (autotuned) {
+		release_clobj();
 
-	HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel");
-	HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
+		HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel");
+		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
+
+		autotuned--;
+	}
 }
 
 static void init(struct fmt_main *_self)
 {
-	char build_opts[64];
-
 	self = _self;
-
-	snprintf(build_opts, sizeof(build_opts),
-	         "-DKEYLEN=%d -DSALTLEN=%d -DOUTLEN=%d",
-	         (int)sizeof(inbuffer->v),
-	         (int)sizeof(currentsalt.salt),
-	         (int)sizeof(outbuffer->v));
-	opencl_init("$JOHN/kernels/pbkdf2_hmac_sha1_unsplit_kernel.cl",
-	                gpu_id, build_opts);
-
-	crypt_kernel = clCreateKernel(program[gpu_id], "derive_key", &cl_error);
-	HANDLE_CLERROR(cl_error, "Error creating kernel");
+	opencl_prepare_dev(gpu_id);
 }
 
 static void reset(struct db_main *db)
 {
 	if (!autotuned) {
+		char build_opts[64];
+
+		snprintf(build_opts, sizeof(build_opts),
+		         "-DKEYLEN=%d -DSALTLEN=%d -DOUTLEN=%d",
+		         (int)sizeof(inbuffer->v),
+		         (int)sizeof(currentsalt.salt),
+		         (int)sizeof(outbuffer->v));
+		opencl_init("$JOHN/kernels/pbkdf2_hmac_sha1_unsplit_kernel.cl",
+		            gpu_id, build_opts);
+
+		crypt_kernel = clCreateKernel(program[gpu_id], "derive_key", &cl_error);
+		HANDLE_CLERROR(cl_error, "Error creating kernel");
+
 		// Initialize openCL tuning (library) for this format.
 		opencl_init_auto_setup(SEED, 0, NULL, warn, 1,
 		                       self, create_clobj, release_clobj,
@@ -385,13 +376,13 @@ static void set_salt(void *salt)
 	    "Copy salt to gpu");
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & 0xf; }
-static int get_hash_1(int index) { return crypt_out[index][0] & 0xff; }
-static int get_hash_2(int index) { return crypt_out[index][0] & 0xfff; }
-static int get_hash_3(int index) { return crypt_out[index][0] & 0xffff; }
-static int get_hash_4(int index) { return crypt_out[index][0] & 0xfffff; }
-static int get_hash_5(int index) { return crypt_out[index][0] & 0xffffff; }
-static int get_hash_6(int index) { return crypt_out[index][0] & 0x7ffffff; }
+static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
+static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
+static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
+static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
+static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
+static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
+static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
 
 #undef set_key
 static void set_key(char *key, int index)
@@ -414,7 +405,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	int index;
 	size_t *lws = local_work_size ? &local_work_size : NULL;
 
-	global_work_size = local_work_size ? (count + local_work_size - 1) / local_work_size * local_work_size : count;
+	global_work_size = GET_MULTIPLE_OR_BIGGER(count, local_work_size);
 
 #ifdef _OPENMP
 #pragma omp parallel for
@@ -432,18 +423,21 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	}
 
 	/// Copy data to gpu
-	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_in, CL_FALSE, 0,
+	BENCH_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_in, CL_FALSE, 0,
 		insize, inbuffer, 0, NULL, multi_profilingEvent[0]),
 	        "Copy data to gpu");
 
 	/// Run kernel
-	HANDLE_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], crypt_kernel, 1,
+	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], crypt_kernel, 1,
 		NULL, &global_work_size, lws, 0, NULL,
 	        multi_profilingEvent[1]), "Run kernel");
 
 	/// Read the result back
-	HANDLE_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_out, CL_TRUE, 0,
+	BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_out, CL_TRUE, 0,
 		outsize, outbuffer, 0, NULL, multi_profilingEvent[2]), "Copy result back");
+
+	if (ocl_autotune_running)
+		return count;
 
 #ifdef _OPENMP
 #pragma omp parallel for
@@ -486,7 +480,6 @@ static int cmp_exact(char *source, int index)
 	return 1;
 }
 
-#if FMT_MAIN_VERSION > 11
 static unsigned int iteration_count(void *salt)
 {
 	sxc_salt *my_salt;
@@ -494,7 +487,6 @@ static unsigned int iteration_count(void *salt)
 	my_salt = salt;
 	return (unsigned int) my_salt->iterations;
 }
-#endif
 struct fmt_main fmt_opencl_sxc = {
 	{
 		FORMAT_LABEL,
@@ -511,11 +503,9 @@ struct fmt_main fmt_opencl_sxc = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
 		{
 			"iteration count",
 		},
-#endif
 		sxc_tests
 	}, {
 		init,
@@ -526,11 +516,9 @@ struct fmt_main fmt_opencl_sxc = {
 		fmt_default_split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{
 			iteration_count,
 		},
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,

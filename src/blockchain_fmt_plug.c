@@ -28,7 +28,7 @@ john_register_one(&fmt_blockchain);
 #include "options.h"
 #include "johnswap.h"
 #include "pbkdf2_hmac_sha1.h"
-#include <openssl/aes.h>
+#include "aes.h"
 #ifdef _OPENMP
 #include <omp.h>
 //#define OMP_SCALE               1 // tuned on core i7
@@ -97,10 +97,16 @@ static void init(struct fmt_main *self)
 	omp_t *= OMP_SCALE;
 	self->params.max_keys_per_crypt *= omp_t;
 #endif
-	saved_key = mem_calloc_tiny(sizeof(*saved_key) *
+	saved_key = mem_calloc_align(sizeof(*saved_key),
 			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	cracked = mem_calloc_tiny(sizeof(*cracked) *
+	cracked = mem_calloc_align(sizeof(*cracked),
 			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
+}
+
+static void done(void)
+{
+	MEM_FREE(cracked);
+	MEM_FREE(saved_key);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
@@ -117,13 +123,9 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	if ((p = strtokm(ctcopy, "$")) == NULL)
 		goto err;
 	if (!strcmp(p, "v2")) {
-		int iter;
 		if ((p = strtokm(NULL, "$")) == NULL)
 			goto err;
 		if (!isdec(p))
-			goto err;
-		iter = atoi(p);
-		if (iter < 0)
 			goto err;
 		if ((p = strtokm(NULL, "$")) == NULL)
 			goto err;
@@ -131,11 +133,11 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	if (!isdec(p))
 		goto err;
 	len = atoi(p);
-	if(len > BIG_ENOUGH || len <= 0)
+	if(len > BIG_ENOUGH || !len)
 		goto err;
 	if ((p = strtokm(NULL, "$")) == NULL)
 		goto err;
-	if (strlen(p) != len * 2 || !ishex(p))
+	if (hexlenl(p) != len * 2)
 		goto err;
 
 	MEM_FREE(keeptr);
@@ -309,22 +311,18 @@ struct fmt_main fmt_blockchain = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		agile_keychain_tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		fmt_default_split,
 		fmt_default_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash

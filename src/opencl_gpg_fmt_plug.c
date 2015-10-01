@@ -208,20 +208,6 @@ static size_t get_task_max_work_group_size()
 	return autotune_get_task_max_work_group_size(FALSE, 0, crypt_kernel);
 }
 
-static size_t get_task_max_size()
-{
-	return 0;
-}
-
-static size_t get_default_workgroup()
-{
-	if (cpu(device_info[gpu_id]))
-		return get_platform_vendor_id(platform_id) == DEV_INTEL ?
-			8 : 1;
-	else
-		return 64;
-}
-
 static void create_clobj(size_t gws, struct fmt_main *self)
 {
 	insize = sizeof(gpg_password) * gws;
@@ -316,23 +302,24 @@ static uint32_t keySize(char algorithm)
 
 static void init(struct fmt_main *_self)
 {
-	char build_opts[64];
-
 	self = _self;
-
-	snprintf(build_opts, sizeof(build_opts),
-	         "-DPLAINTEXT_LENGTH=%d -DSALT_LENGTH=%d",
-	         PLAINTEXT_LENGTH, SALT_LENGTH);
-	opencl_init("$JOHN/kernels/gpg_kernel.cl",
-	                gpu_id, build_opts);
-
-	crypt_kernel = clCreateKernel(program[gpu_id], "gpg", &cl_error);
-	HANDLE_CLERROR(cl_error, "Error creating kernel");
+	opencl_prepare_dev(gpu_id);
 }
 
 static void reset(struct db_main *db)
 {
 	if (!autotuned) {
+		char build_opts[64];
+
+		snprintf(build_opts, sizeof(build_opts),
+		         "-DPLAINTEXT_LENGTH=%d -DSALT_LENGTH=%d",
+		         PLAINTEXT_LENGTH, SALT_LENGTH);
+		opencl_init("$JOHN/kernels/gpg_kernel.cl",
+		            gpu_id, build_opts);
+
+		crypt_kernel = clCreateKernel(program[gpu_id], "gpg", &cl_error);
+		HANDLE_CLERROR(cl_error, "Error creating kernel");
+
 		// Initialize openCL tuning (library) for this format.
 		opencl_init_auto_setup(SEED, 0, NULL, warn, 1, self,
 		                       create_clobj, release_clobj,
@@ -345,10 +332,14 @@ static void reset(struct db_main *db)
 
 static void done(void)
 {
-	release_clobj();
+	if (autotuned) {
+		release_clobj();
 
-	HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel");
-	HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
+		HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel");
+		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
+
+		autotuned--;
+	}
 }
 
 static int valid_cipher_algorithm(int cipher_algorithm)
@@ -421,7 +412,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	if (!isdec(p))
 		goto err;
 	res = atoi(p);
-	if (res > BIG_ENOUGH * 2 || res < 0)
+	if (res > BIG_ENOUGH * 2)
 		goto err;
 	if ((p = strtokm(NULL, "*")) == NULL)	/* bits */
 		goto err;
@@ -429,9 +420,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 		goto err;
 	if ((p = strtokm(NULL, "*")) == NULL)	/* data */
 		goto err;
-	if (strlen(p) / 2 != res)
-		goto err;
-	if (!ishex(p))
+	if (hexlenl(p) != res*2)
 		goto err;
 	if ((p = strtokm(NULL, "*")) == NULL)	/* spec */
 		goto err;
@@ -468,9 +457,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 		goto err;
 	if ((p = strtokm(NULL, "*")) == NULL)	/* iv */
 		goto err;
-	if (strlen(p) != res * 2)
-		goto err;
-	if (!ishex(p))
+	if (hexlenl(p) != res*2)
 		goto err;
 	/* handle "SPEC_SIMPLE" correctly */
 	if ((spec != 0 || usage == 255))
@@ -481,14 +468,11 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	}
 	if ((p = strtokm(NULL, "*")) == NULL)	/* count */
 		goto err;
-	if (!isdec(p))
+	if (!isdec(p)) // FIXME: count == 0 allowed?
 		goto err;
-	res = atoi(p); // FIXME: count <= 0 allowed?
 	if ((p = strtokm(NULL, "*")) == NULL)	/* salt */
 		goto err;
-	if (strlen(p) != SALT_LENGTH * 2)
-		goto err;
-	if (!ishex(p))
+	if (hexlenl(p) != SALT_LENGTH * 2)
 		goto err;
 	/*
 	 * For some test vectors, there are no more fields,
@@ -524,13 +508,11 @@ static int valid(char *ciphertext, struct fmt_main *self)
 		if (!isdec(p))
 			goto err;
 		res = atoi(p);
-		if (res > BIG_ENOUGH * 2 || res < 0)
+		if (res > BIG_ENOUGH * 2)
 			goto err; // FIXME: warn if BIG_ENOUGH isn't big enough?
 		if ((p = strtokm(NULL, "*")) == NULL)
 			goto err;
-		if (strlen(p) != res * 2) /* validates res is a valid int */
-			goto err;
-		if (!ishex(p))
+		if (hexlenl(p) != res * 2) /* validates res is a valid int */
 			goto err;
 		p = strtokm(NULL, "*");  /* NOTE, do not goto err if null, we WANT p nul if there are no fields */
 	}
@@ -1035,7 +1017,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	int index = 0;
 	size_t *lws = local_work_size ? &local_work_size : NULL;
 
-	global_work_size = local_work_size ? (count + local_work_size - 1) / local_work_size * local_work_size : count;
+	global_work_size = GET_MULTIPLE_OR_BIGGER(count, local_work_size);
 
 	if (any_cracked) {
 		memset(cracked, 0, cracked_size);
@@ -1043,20 +1025,23 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	}
 
 	/// Copy data to gpu
-	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_in, CL_FALSE, 0,
+	BENCH_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_in, CL_FALSE, 0,
 		insize, inbuffer, 0, NULL, multi_profilingEvent[0]),
 		"Copy data to gpu");
 
 	/// Run kernel
-	HANDLE_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], crypt_kernel, 1,
+	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], crypt_kernel, 1,
 		NULL, &global_work_size, lws, 0, NULL,
 		multi_profilingEvent[1]),
 		"Run kernel");
 
 	/// Read the result back
-	HANDLE_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_out, CL_TRUE, 0,
+	BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_out, CL_TRUE, 0,
 		outsize, outbuffer, 0, NULL, multi_profilingEvent[2]),
 		"Copy result back");
+
+	if (ocl_autotune_running)
+		return count;
 
 #ifdef _OPENMP
 #pragma omp parallel for
@@ -1089,7 +1074,6 @@ static int cmp_exact(char *source, int index)
 	return 1;
 }
 
-#if FMT_MAIN_VERSION > 11
 /*
  * Report gpg --s2k-count n as 1st tunable cost,
  * hash algorithm as 2nd tunable cost,
@@ -1126,7 +1110,6 @@ static unsigned int gpg_cipher_algorithm(void *salt)
 	my_salt = salt;
 	return (unsigned int) my_salt->cipher_algorithm;
 }
-#endif
 
 struct fmt_main fmt_opencl_gpg = {
 	{
@@ -1144,13 +1127,11 @@ struct fmt_main fmt_opencl_gpg = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
 		{
 			"s2k-count", /* only for gpg --s2k-mode 3, see man gpg, option --s2k-count n */
 			"hash algorithm [1:MD5 2:SHA1 3:RIPEMD160 8:SHA256 9:SHA384 10:SHA512 11:SHA224]",
 			"cipher algorithm [1:IDEA 2:3DES 3:CAST5 4:Blowfish 7:AES128 8:AES192 9:AES256]",
 		},
-#endif
 		gpg_tests
 	},
 	{
@@ -1162,13 +1143,11 @@ struct fmt_main fmt_opencl_gpg = {
 		fmt_default_split,
 		fmt_default_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{
 			gpg_s2k_count,
 			gpg_hash_algorithm,
 			gpg_cipher_algorithm,
 		},
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash

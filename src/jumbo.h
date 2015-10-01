@@ -307,13 +307,6 @@ extern int fileno(FILE *);
 #define fdopen _fdopen
 #endif
 
-#ifndef MEMDBG_ON
-#if ((AC_BUILT && HAVE__STRDUP)  || (!AC_BUILT && _MSC_VER)) && !defined (strdup)
-#undef strdup
-#define strdup _strdup
-#endif
-#endif
-
 #if (AC_BUILT && !HAVE_SNPRINTF && HAVE_SPRINTF_S) || (!AC_BUILT && _MSC_VER)
 #undef  snprintf
 #define snprintf sprintf_s
@@ -396,8 +389,14 @@ char *strrev(char *str);
 extern size_t strnlen(const char *s, size_t max);
 #endif
 
-#if AC_BUILT && !HAVE_STRCASESTR
+#if AC_BUILT && !HAVE_STRCASESTR || !AC_BUILT && defined(__MINGW__)
 char *strcasestr(const char *haystack, const char *needle);
 #endif
+
+/*
+ * Standard PKCS padding check. On success, returns net length.
+ * On failure, returns -1.
+ */
+extern int check_pkcs_pad(const unsigned char* data, size_t len, int blocksize);
 
 #endif /* _JTR_JUMBO_H */

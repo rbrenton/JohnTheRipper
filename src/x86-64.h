@@ -214,7 +214,7 @@
 
 #ifdef __SSE2__
 
-#if __AVX512__
+#if __AVX512F__
 #define SIMD_COEF_32 16
 #define SIMD_COEF_64 8
 #elif __AVX2__
@@ -229,7 +229,7 @@
 #endif
 
 #ifndef SIMD_PARA_MD4
-#if defined(__INTEL_COMPILER) || defined(USING_ICC_S_FILE)
+#if defined(__INTEL_COMPILER)
 #define SIMD_PARA_MD4			3
 #elif defined(__clang__)
 #define SIMD_PARA_MD4			4
@@ -247,7 +247,7 @@
 #endif
 
 #ifndef SIMD_PARA_MD5
-#if defined(__INTEL_COMPILER) || defined(USING_ICC_S_FILE)
+#if defined(__INTEL_COMPILER)
 #define SIMD_PARA_MD5			3
 #elif defined(__clang__)
 #define SIMD_PARA_MD5			5
@@ -267,7 +267,7 @@
 #endif
 
 #ifndef SIMD_PARA_SHA1
-#if defined(__INTEL_COMPILER) || defined(USING_ICC_S_FILE)
+#if defined(__INTEL_COMPILER)
 #define SIMD_PARA_SHA1			1
 #elif defined(__clang__)
 #define SIMD_PARA_SHA1			2
@@ -283,7 +283,11 @@
 #endif
 
 #ifndef SIMD_PARA_SHA256
+#if __XOP__
+#define SIMD_PARA_SHA256 2
+#else
 #define SIMD_PARA_SHA256 1
+#endif
 #endif
 #ifndef SIMD_PARA_SHA512
 #define SIMD_PARA_SHA512 1
@@ -345,10 +349,12 @@
  * likely benefit from the 3x interleaving with no adverse effects for the
  * multi-threaded case.
  */
+#ifndef BF_X2
 #ifdef __AVX__
 #define BF_X2				1
 #else
 #define BF_X2				3
+#endif
 #endif
 
 #endif

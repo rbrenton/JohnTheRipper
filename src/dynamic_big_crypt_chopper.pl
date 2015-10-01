@@ -87,17 +87,42 @@ sub in_defined {
 			$define_stack[$nstack++] = 0;
 			return 0;
 		}
+	} elsif (substr($Line,0,8) eq "#ifndef ") {
+		# ok, see if this is one of our defines, or UNDEFINES.
+		my $ch = $defined{substr($Line,8)};
+		if (defined($ch) && $ch eq 'N') {
+			$define_stack[$nstack++] = 1;
+			return 0;
+		}
+		if (defined($ch) && $ch eq 'Y') {
+			$define_stack[$nstack++] = 0;
+			return 0;
+		}
 	} elsif (substr($Line,0,10) eq "#else  // ") {
 		# this one may be the else statement for something defined or undefined.
-		my $pos = index($Line, "defined ");
+		my $pos = index($Line, " defined ");
 		if ($pos != -1) {
-			my $ch = $defined{substr($Line,$pos+8)};
+			my $ch = $defined{substr($Line,$pos+9)};
 			$_[0] = substr($Line,0,5);
 			if (defined($ch) && $ch eq 'Y') {
 				$define_stack[$nstack-1] = 0;
 				return 0;
 			}
 			if (defined($ch) && $ch eq 'N') {
+				$define_stack[$nstack-1] = 1;
+				return 0;
+			}
+		}
+		# this is the else for #ifndef
+		$pos = index($Line, " !defined ");
+		if ($pos != -1) {
+			my $ch = $defined{substr($Line,$pos+10)};
+			$_[0] = substr($Line,0,5);
+			if (defined($ch) && $ch eq 'N') {
+				$define_stack[$nstack-1] = 0;
+				return 0;
+			}
+			if (defined($ch) && $ch eq 'Y') {
 				$define_stack[$nstack-1] = 1;
 				return 0;
 			}
@@ -113,6 +138,10 @@ sub in_defined {
 				return 0;
 			}
 		}
+	}
+	# if there are ANY undefined items in the stack, then we ARE undefined
+	for (my $x = $nstack-1; $x >= 0; --$x) {
+		if ($define_stack[$x] == 0) {return 0;}
 	}
 	return $define_stack[$nstack-1];
 }

@@ -129,20 +129,6 @@ static size_t get_task_max_work_group_size()
 	return s;
 }
 
-static size_t get_task_max_size()
-{
-	return 0;
-}
-
-static size_t get_default_workgroup()
-{
-	if (cpu(device_info[gpu_id]))
-		return get_platform_vendor_id(platform_id) == DEV_INTEL ?
-			8 : 1;
-	else
-		return 64;
-}
-
 static void create_clobj(size_t gws, struct fmt_main *self)
 {
 	pinned_key = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, max_len * gws, NULL, &ret_code);
@@ -208,43 +194,51 @@ static void release_clobj(void)
 
 static void done(void)
 {
-	release_clobj();
+	if (autotuned) {
+		release_clobj();
 
-	HANDLE_CLERROR(clReleaseKernel(oldoffice_utf16), "Release kernel");
-	HANDLE_CLERROR(clReleaseKernel(oldoffice_md5), "Release kernel");
-	HANDLE_CLERROR(clReleaseKernel(oldoffice_sha1), "Release kernel");
-	HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
+		HANDLE_CLERROR(clReleaseKernel(oldoffice_utf16), "Release kernel");
+		HANDLE_CLERROR(clReleaseKernel(oldoffice_md5), "Release kernel");
+		HANDLE_CLERROR(clReleaseKernel(oldoffice_sha1), "Release kernel");
+		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
+
+		autotuned--;
+	}
 }
 
 static void init(struct fmt_main *_self)
 {
-	char build_opts[96];
-
 	self = _self;
+
+	opencl_prepare_dev(gpu_id);
 
 	if (pers_opts.target_enc == UTF_8)
 		max_len = self->params.plaintext_length =
 			MIN(125, 3 * PLAINTEXT_LENGTH);
-
-	snprintf(build_opts, sizeof(build_opts),
-	        "-D%s -DPLAINTEXT_LENGTH=%u",
-	         cp_id2macro(pers_opts.target_enc), PLAINTEXT_LENGTH);
-	opencl_init("$JOHN/kernels/oldoffice_kernel.cl", gpu_id, build_opts);
-
-	/* create kernels to execute */
-	oldoffice_utf16 = clCreateKernel(program[gpu_id], "oldoffice_utf16", &ret_code);
-	HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel name?");
-	crypt_kernel = oldoffice_md5 =
-		clCreateKernel(program[gpu_id], "oldoffice_md5", &ret_code);
-	oldoffice_sha1 =
-		clCreateKernel(program[gpu_id], "oldoffice_sha1", &ret_code);
-	HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel name?");
 }
 
 static void reset(struct db_main *db)
 {
 	if (!autotuned) {
 		size_t gws_limit = 4 << 20;
+		char build_opts[96];
+
+		snprintf(build_opts, sizeof(build_opts),
+#if !NT_FULL_UNICODE
+		         "-DUCS_2 "
+#endif
+		         "-D%s -DPLAINTEXT_LENGTH=%u",
+		         cp_id2macro(pers_opts.target_enc), PLAINTEXT_LENGTH);
+		opencl_init("$JOHN/kernels/oldoffice_kernel.cl", gpu_id, build_opts);
+
+		/* create kernels to execute */
+		oldoffice_utf16 = clCreateKernel(program[gpu_id], "oldoffice_utf16", &ret_code);
+		HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel name?");
+		crypt_kernel = oldoffice_md5 =
+			clCreateKernel(program[gpu_id], "oldoffice_md5", &ret_code);
+		oldoffice_sha1 =
+			clCreateKernel(program[gpu_id], "oldoffice_sha1", &ret_code);
+		HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel name?");
 
 		// Initialize openCL tuning (library) for this format.
 		opencl_init_auto_setup(SEED, 0, NULL, warn, 3,
@@ -276,23 +270,17 @@ static int valid(char *ciphertext, struct fmt_main *self)
 		goto error;
 	if (!(ptr = strtokm(NULL, "*"))) /* salt */
 		goto error;
-	if (strlen(ptr) != 32)
-		goto error;
-	if (!ishex(ptr))
+	if (hexlen(ptr) != 32)
 		goto error;
 	if (!(ptr = strtokm(NULL, "*"))) /* verifier */
 		goto error;
-	if (strlen(ptr) != 32)
-		goto error;
-	if (!ishex(ptr))
+	if (hexlen(ptr) != 32)
 		goto error;
 	if (!(ptr = strtokm(NULL, "*"))) /* verifier hash */
 		goto error;
-	if (res < 3 && strlen(ptr) != 32)
+	if (res < 3 && hexlen(ptr) != 32)
 		goto error;
-	if (res >= 3 && strlen(ptr) != 40)
-		goto error;
-	if (!ishex(ptr))
+	if (res >= 3 && hexlen(ptr) != 40)
 		goto error;
 	MEM_FREE(keeptr);
 	return 1;
@@ -422,26 +410,26 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 	//fprintf(stderr, "%s(%d) lws "Zu" gws "Zu" kidx %u m %d k %d\n", __FUNCTION__, count, lws, global_work_size, key_idx, m, new_keys);
 
-	if (new_keys) {
+	if (new_keys || ocl_autotune_running) {
 		/* Self-test kludge */
 		if (idx_offset > 4 * (global_work_size + 1))
 			idx_offset = 0;
 
-		HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], cl_saved_key, CL_FALSE, key_offset, key_idx - key_offset, saved_key + key_offset, 0, NULL, multi_profilingEvent[0]), "Failed transferring keys");
-		HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], cl_saved_idx, CL_FALSE, idx_offset, 4 * (global_work_size + 1) - idx_offset, saved_idx + (idx_offset / 4), 0, NULL, multi_profilingEvent[1]), "Failed transferring index");
-		HANDLE_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], oldoffice_utf16, 1, NULL, &global_work_size, &lws, 0, NULL, multi_profilingEvent[2]), "Failed running first kernel");
+		BENCH_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], cl_saved_key, CL_FALSE, key_offset, key_idx - key_offset, saved_key + key_offset, 0, NULL, multi_profilingEvent[0]), "Failed transferring keys");
+		BENCH_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], cl_saved_idx, CL_FALSE, idx_offset, 4 * (global_work_size + 1) - idx_offset, saved_idx + (idx_offset / 4), 0, NULL, multi_profilingEvent[1]), "Failed transferring index");
+		BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], oldoffice_utf16, 1, NULL, &global_work_size, &lws, 0, NULL, multi_profilingEvent[2]), "Failed running first kernel");
 
 		new_keys = 0;
 	}
 
-	if(cur_salt->type < 3) {
-		HANDLE_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], oldoffice_md5, 1, NULL, &global_work_size, &lws, 0, NULL, multi_profilingEvent[3]), "Failed running second kernel");
+	if (cur_salt->type < 3) {
+		BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], oldoffice_md5, 1, NULL, &global_work_size, &lws, 0, NULL, multi_profilingEvent[3]), "Failed running second kernel");
 	} else {
-		HANDLE_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], oldoffice_sha1, 1, NULL, &global_work_size, &lws, 0, NULL, multi_profilingEvent[3]), "Failed running first kernel");
+		BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], oldoffice_sha1, 1, NULL, &global_work_size, &lws, 0, NULL, multi_profilingEvent[3]), "Failed running first kernel");
 	}
 
-	if (bench_running || m) {
-		HANDLE_CLERROR(clEnqueueReadBuffer(queue[gpu_id], cl_result, CL_TRUE, 0, sizeof(unsigned int) * global_work_size, cracked, 0, NULL, multi_profilingEvent[4]), "failed reading results back");
+	if (bench_running || ocl_autotune_running || m) {
+		BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], cl_result, CL_TRUE, 0, sizeof(unsigned int) * global_work_size, cracked, 0, NULL, multi_profilingEvent[4]), "failed reading results back");
 
 		any_cracked = 0;
 
@@ -451,9 +439,9 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			break;
 		}
 	} else {
-		HANDLE_CLERROR(clEnqueueReadBuffer(queue[gpu_id], cl_salt, CL_TRUE, 0, SALT_SIZE, cur_salt, 0, NULL, NULL), "Failed transferring salt");
+		BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], cl_salt, CL_TRUE, 0, SALT_SIZE, cur_salt, 0, NULL, NULL), "Failed transferring salt");
 		if ((any_cracked = cur_salt->has_mitm))
-			HANDLE_CLERROR(clEnqueueReadBuffer(queue[gpu_id], cl_result, CL_TRUE, 0, sizeof(unsigned int) * global_work_size, cracked, 0, NULL, multi_profilingEvent[4]), "failed reading results back");
+			BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], cl_result, CL_TRUE, 0, sizeof(unsigned int) * global_work_size, cracked, 0, NULL, multi_profilingEvent[4]), "failed reading results back");
 	}
 
 	return count;
@@ -517,7 +505,6 @@ static char *get_key(int index)
 	return (char*)utf16_to_enc(u16);
 }
 
-#if FMT_MAIN_VERSION > 11
 static unsigned int oo_hash_type(void *salt)
 {
 	struct custom_salt *my_salt;
@@ -525,7 +512,6 @@ static unsigned int oo_hash_type(void *salt)
 	my_salt = salt;
 	return (unsigned int) my_salt->type;
 }
-#endif
 
 struct fmt_main FORMAT_STRUCT = {
 	{
@@ -543,11 +529,9 @@ struct fmt_main FORMAT_STRUCT = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_UNICODE | FMT_UTF8 | FMT_SPLIT_UNIFIES_CASE,
-#if FMT_MAIN_VERSION > 11
 		{
 			"hash type",
 		},
-#endif
 		oo_tests
 	}, {
 		init,
@@ -558,11 +542,9 @@ struct fmt_main FORMAT_STRUCT = {
 		split,
 		fmt_default_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{
 			oo_hash_type,
 		},
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash

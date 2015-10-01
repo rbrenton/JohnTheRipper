@@ -25,7 +25,11 @@
 #ifdef USE_BITSELECT
 #define F(x, y, z)	bitselect((z), (y), (x))
 #else
-#define F(x, y, z)	((z) ^ ((x) & ((y) ^ (z))))
+#if HAVE_ANDNOT
+#define F(x, y, z) ((x & y) ^ ((~x) & z))
+#else
+#define F(x, y, z) (z ^ (x & (y ^ z)))
+#endif
 #endif
 #define G(x, y, z)	(((x) & ((y) | (z))) | ((y) & (z)))
 
@@ -229,7 +233,7 @@ __kernel void md4(__global uint *keys,
 		  __global
 #endif
 		  uint *int_keys
-#if USE_CONST_CACHE && gpu_amd(DEVICE_INFO)
+#if !defined(__OS_X__) && USE_CONST_CACHE && gpu_amd(DEVICE_INFO)
 		__attribute__((max_constant_size (NUM_INT_KEYS * 4)))
 #endif
 		 , __global uint *bitmaps,
@@ -240,8 +244,6 @@ __kernel void md4(__global uint *keys,
 		  volatile __global uint *bitmap_dupe)
 {
 	uint i;
-	uint lid = get_local_id(0);
-	uint lws = get_local_size(0);
 	uint gid = get_global_id(0);
 	uint base = index[gid];
 	uint W[16] = { 0 };
@@ -281,6 +283,8 @@ __kernel void md4(__global uint *keys,
 #endif
 
 #if USE_LOCAL_BITMAPS
+	uint lid = get_local_id(0);
+	uint lws = get_local_size(0);
 	uint __local s_bitmaps[(BITMAP_SIZE_BITS >> 5) * SELECT_CMP_STEPS];
 
 	for(i = 0; i < (((BITMAP_SIZE_BITS >> 5) * SELECT_CMP_STEPS) / lws); i++)

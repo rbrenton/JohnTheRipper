@@ -111,20 +111,6 @@ static size_t get_task_max_work_group_size()
 	return autotune_get_task_max_work_group_size(FALSE, 0, crypt_kernel);
 }
 
-static size_t get_task_max_size()
-{
-	return 0;
-}
-
-static size_t get_default_workgroup()
-{
-	if (cpu(device_info[gpu_id]))
-		return get_platform_vendor_id(platform_id) == DEV_INTEL ?
-			8 : 1;
-	else
-		return 64;
-}
-
 static void create_clobj(size_t kpc, struct fmt_main *self)
 {
 	self->params.min_keys_per_crypt = self->params.max_keys_per_crypt = kpc;
@@ -198,30 +184,35 @@ static void release_clobj(void){
 
 static void done(void)
 {
-	release_clobj();
+	if (autotuned) {
+		release_clobj();
 
-	HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel");
-	HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
+		HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel");
+		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
+
+		autotuned--;
+	}
 }
 
-static void fmt_ssha_init(struct fmt_main *_self)
+static void init(struct fmt_main *_self)
 {
-	char build_opts[64];
-
 	self = _self;
-
-	snprintf(build_opts, sizeof(build_opts),
-	         "-DPLAINTEXT_LENGTH=%d", PLAINTEXT_LENGTH);
-	opencl_init("$JOHN/kernels/ssha_kernel.cl", gpu_id, build_opts);
-
-	// create kernel to execute
-	crypt_kernel = clCreateKernel(program[gpu_id], "sha1_crypt_kernel", &ret_code);
-	HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel name?");
+	opencl_prepare_dev(gpu_id);
 }
 
 static void reset(struct db_main *db)
 {
 	if (!autotuned) {
+		char build_opts[64];
+
+		snprintf(build_opts, sizeof(build_opts),
+		         "-DPLAINTEXT_LENGTH=%d", PLAINTEXT_LENGTH);
+		opencl_init("$JOHN/kernels/ssha_kernel.cl", gpu_id, build_opts);
+
+		// create kernel to execute
+		crypt_kernel = clCreateKernel(program[gpu_id], "sha1_crypt_kernel", &ret_code);
+		HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel name?");
+
 		// Initialize openCL tuning (library) for this format.
 		opencl_init_auto_setup(SEED, 1, NULL, warn,
 		                       1, self, create_clobj, release_clobj,
@@ -270,13 +261,13 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	return 1;
 }
 
-static int get_hash_0(int index) { return outbuffer[index] & 0xf; }
-static int get_hash_1(int index) { return outbuffer[index] & 0xff; }
-static int get_hash_2(int index) { return outbuffer[index] & 0xfff; }
-static int get_hash_3(int index) { return outbuffer[index] & 0xffff; }
-static int get_hash_4(int index) { return outbuffer[index] & 0xfffff; }
-static int get_hash_5(int index) { return outbuffer[index] & 0xffffff; }
-static int get_hash_6(int index) { return outbuffer[index] & 0x7ffffff; }
+static int get_hash_0(int index) { return outbuffer[index] & PH_MASK_0; }
+static int get_hash_1(int index) { return outbuffer[index] & PH_MASK_1; }
+static int get_hash_2(int index) { return outbuffer[index] & PH_MASK_2; }
+static int get_hash_3(int index) { return outbuffer[index] & PH_MASK_3; }
+static int get_hash_4(int index) { return outbuffer[index] & PH_MASK_4; }
+static int get_hash_5(int index) { return outbuffer[index] & PH_MASK_5; }
+static int get_hash_6(int index) { return outbuffer[index] & PH_MASK_6; }
 
 static int salt_hash(void *salt){
 	return *((ARCH_WORD_32 *) salt) & (SALT_HASH_SIZE - 1);
@@ -353,15 +344,15 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	const int count = *pcount;
 	size_t *lws = local_work_size ? &local_work_size : NULL;
 
-	global_work_size = local_work_size ? (count + local_work_size - 1) / local_work_size * local_work_size : count;
+	global_work_size = GET_MULTIPLE_OR_BIGGER(count, local_work_size);
 
-	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], buffer_keys, CL_FALSE, 0, PLAINTEXT_LENGTH * global_work_size, saved_plain, 0, NULL, multi_profilingEvent[0]), "failed in clEnqueueWriteBuffer saved_plain");
+	BENCH_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], buffer_keys, CL_FALSE, 0, PLAINTEXT_LENGTH * global_work_size, saved_plain, 0, NULL, multi_profilingEvent[0]), "failed in clEnqueueWriteBuffer saved_plain");
 
-	HANDLE_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], crypt_kernel, 1, NULL, &global_work_size, lws, 0, NULL, multi_profilingEvent[1]), "failed in clEnqueueNDRangeKernel");
-	HANDLE_CLERROR(clFinish(queue[gpu_id]), "clFinish error");
+	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], crypt_kernel, 1, NULL, &global_work_size, lws, 0, NULL, multi_profilingEvent[1]), "failed in clEnqueueNDRangeKernel");
+	BENCH_CLERROR(clFinish(queue[gpu_id]), "clFinish error");
 
 	// read back partial hashes
-	HANDLE_CLERROR(clEnqueueReadBuffer(queue[gpu_id], buffer_out, CL_TRUE, 0, sizeof(cl_uint) * global_work_size, outbuffer, 0, NULL, multi_profilingEvent[2]), "failed in clEnqueueReadBuffer -reading partial hashes");
+	BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], buffer_out, CL_TRUE, 0, sizeof(cl_uint) * global_work_size, outbuffer, 0, NULL, multi_profilingEvent[2]), "failed in clEnqueueReadBuffer -reading partial hashes");
 	have_full_hashes = 0;
 
 	return count;
@@ -383,12 +374,10 @@ struct fmt_main fmt_opencl_NSLDAPS = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		tests
 	}, {
-		fmt_ssha_init,
+		init,
 		done,
 		reset,
 		fmt_default_prepare,
@@ -396,9 +385,7 @@ struct fmt_main fmt_opencl_NSLDAPS = {
 		fmt_default_split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,

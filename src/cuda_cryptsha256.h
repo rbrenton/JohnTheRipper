@@ -18,8 +18,8 @@
 
 #define rol(x,n) ((x << n) | (x >> (32-n)))
 #define ror(x,n) ((x >> n) | (x << (32-n)))
-#define Ch(x,y,z) ((x & y) ^ ( (~x) & z))
-#define Maj(x,y,z) ((x & y) ^ (x & z) ^ (y & z))
+#define Ch(x, y, z) (z ^ (x & (y ^ z)))
+#define Maj(x, y, z) ((x & y) | (z & (x | y)))
 #define Sigma0(x) ((ror(x,2))  ^ (ror(x,13)) ^ (ror(x,22)))
 #define Sigma1(x) ((ror(x,6))  ^ (ror(x,11)) ^ (ror(x,25)))
 #define sigma0(x) ((ror(x,7))  ^ (ror(x,18)) ^(x>>3))
@@ -40,8 +40,8 @@ typedef struct {
 } sha256_ctx;
 
 typedef struct {
-	unsigned char saltlen;
 	uint32_t rounds;
+	unsigned char saltlen;
 	char salt[SALT_LEN_MAX + 1];
 } crypt_sha256_salt;
 

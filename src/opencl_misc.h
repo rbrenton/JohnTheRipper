@@ -39,10 +39,46 @@ typedef long int64_t;
 #define MAX(a,b) ((a)>(b)?(a):(b))
 #endif
 
-#if !gpu_nvidia(DEVICE_INFO) || nvidia_sm_5x(DEVICE_INFO)
+#if !gpu_nvidia(DEVICE_INFO) || SM_MAJOR >= 5
 #define USE_BITSELECT 1
-#elif gpu_nvidia(DEVICE_INFO)
+#endif
+
+#if SM_MAJOR < 2
 #define OLD_NVIDIA 1
+#endif
+
+#if cpu(DEVICE_INFO)
+#define HAVE_ANDNOT 1
+#endif
+
+#if gpu_amd(DEVICE_INFO)
+#pragma OPENCL EXTENSION cl_amd_media_ops : enable
+#define BITALIGN(hi, lo, s) amd_bitalign((hi), (lo), (s))
+#else
+#if SM_MAJOR > 3 || (SM_MAJOR == 3 && SM_MINOR >= 2)
+inline uint funnel_shift_right(uint hi, uint lo, uint s) {
+	uint r;
+	asm("shf.r.wrap.b32 %0, %1, %2, %3;"
+	    : "=r" (r)
+	    : "r" (lo), "r" (hi), "r" (s));
+	return r;
+}
+inline uint funnel_shift_right_imm(uint hi, uint lo, uint s) {
+	uint r;
+	asm("shf.r.wrap.b32 %0, %1, %2, %3;"
+	    : "=r" (r)
+	    : "r" (lo), "r" (hi), "i" (s));
+	return r;
+}
+#define BITALIGN(hi, lo, s) funnel_shift_right(hi, lo, s)
+#define BITALIGN_IMM(hi, lo, s) funnel_shift_right_imm(hi, lo, s)
+#else
+#define BITALIGN(hi, lo, s) (((hi) << (32 - (s))) | ((lo) >> (s)))
+#endif
+#endif
+
+#ifndef BITALIGN_IMM
+#define BITALIGN_IMM(hi, lo, s) BITALIGN(hi, lo, s)
 #endif
 
 #define CONCAT(TYPE,WIDTH)	TYPE ## WIDTH

@@ -27,7 +27,7 @@
 #include "arch.h"
 #ifndef DYNAMIC_DISABLED
 
-#include "sse-intrinsics.h"
+#include "simd-intrinsics.h"
 #include <openssl/opensslv.h>
 
 #ifdef _OPENMP
@@ -89,6 +89,13 @@ typedef struct DYNAMIC_Constants_t
 #define MGF__SKEIN256    0x20
 #define MGF__SKEIN384    0x21
 #define MGF__SKEIN512    0x22
+#define MGF__SHA3_224    0x23
+#define MGF__SHA3_256    0x24
+#define MGF__SHA3_384    0x25
+#define MGF__SHA3_512    0x26
+#define MGF__KECCAK_256  0x27
+#define MGF__KECCAK_512  0x28
+// LARGE_HASH_EDIT_POINT
 
 // These are the 'flags' that specify certain characterstics of the format.
 // Things like salted, not sse2, and special 'loading' of the keys.
@@ -116,6 +123,7 @@ typedef struct DYNAMIC_Constants_t
 #define MGF_SALT_AS_HEX_GOST        ((((ARCH_WORD_64)MGF__GOST      )<<56)|MGF_SALT_AS_HEX)
 #define MGF_SALT_AS_HEX_WHIRLPOOL   ((((ARCH_WORD_64)MGF__WHIRLPOOL )<<56)|MGF_SALT_AS_HEX)
 #define MGF_SALT_AS_HEX_Tiger       ((((ARCH_WORD_64)MGF__Tiger     )<<56)|MGF_SALT_AS_HEX)
+#define MGF_SALT_AS_HEX_TIGER       ((((ARCH_WORD_64)MGF__Tiger     )<<56)|MGF_SALT_AS_HEX)
 #define MGF_SALT_AS_HEX_RIPEMD128   ((((ARCH_WORD_64)MGF__RIPEMD128 )<<56)|MGF_SALT_AS_HEX)
 #define MGF_SALT_AS_HEX_RIPEMD160   ((((ARCH_WORD_64)MGF__RIPEMD160 )<<56)|MGF_SALT_AS_HEX)
 #define MGF_SALT_AS_HEX_RIPEMD256   ((((ARCH_WORD_64)MGF__RIPEMD256 )<<56)|MGF_SALT_AS_HEX)
@@ -141,6 +149,14 @@ typedef struct DYNAMIC_Constants_t
 #define MGF_SALT_AS_HEX_SKEIN256    ((((ARCH_WORD_64)MGF__SKEIN256  )<<56)|MGF_SALT_AS_HEX)
 #define MGF_SALT_AS_HEX_SKEIN384    ((((ARCH_WORD_64)MGF__SKEIN384  )<<56)|MGF_SALT_AS_HEX)
 #define MGF_SALT_AS_HEX_SKEIN512    ((((ARCH_WORD_64)MGF__SKEIN512  )<<56)|MGF_SALT_AS_HEX)
+#define MGF_SALT_AS_HEX_SHA3_224    ((((ARCH_WORD_64)MGF__SHA3_224  )<<56)|MGF_SALT_AS_HEX)
+#define MGF_SALT_AS_HEX_SHA3_256    ((((ARCH_WORD_64)MGF__SHA3_256  )<<56)|MGF_SALT_AS_HEX)
+#define MGF_SALT_AS_HEX_SHA3_384    ((((ARCH_WORD_64)MGF__SHA3_384  )<<56)|MGF_SALT_AS_HEX)
+#define MGF_SALT_AS_HEX_SHA3_512    ((((ARCH_WORD_64)MGF__SHA3_512  )<<56)|MGF_SALT_AS_HEX)
+#define MGF_SALT_AS_HEX_KECCAK_256  ((((ARCH_WORD_64)MGF__KECCAK_256)<<56)|MGF_SALT_AS_HEX)
+#define MGF_SALT_AS_HEX_KECCAK_512  ((((ARCH_WORD_64)MGF__KECCAK_512)<<56)|MGF_SALT_AS_HEX)
+// LARGE_HASH_EDIT_POINT
+
 #define MGF_INPBASE64_4x6            0x00000200
 #define MGF_StartInX86Mode           0x00000400
 #define MGF_SALT_AS_HEX_TO_SALT2    (0x00000800|MGF_SALTED)
@@ -171,7 +187,7 @@ typedef struct DYNAMIC_Constants_t
 // These are special loader flags.  They specify that keys loads are 'special', and
 // do MORE than simply load keys into the keys[] array.  They may preload the keys
 // into input, may load keys into keys, but call crypt, may do that and call base16
-// convert, and may even point different functions than 'defalt' (such as phpass).
+// convert, and may even point different functions than 'defalt'
 // If high bit of flags is set, then at least ONE of these flags has been used
 #define MGF_KEYS_INPUT                   0x00000001
 #define MGF_KEYS_CRYPT_IN2               0x00000002
@@ -189,6 +205,7 @@ typedef struct DYNAMIC_Constants_t
 #define MGF_KEYS_BASE16_IN1_GOST        ((((ARCH_WORD_64)MGF__GOST      )<<56)|MGF_KEYS_BASE16_IN1)
 #define MGF_KEYS_BASE16_IN1_WHIRLPOOL   ((((ARCH_WORD_64)MGF__WHIRLPOOL )<<56)|MGF_KEYS_BASE16_IN1)
 #define MGF_KEYS_BASE16_IN1_Tiger       ((((ARCH_WORD_64)MGF__Tiger     )<<56)|MGF_KEYS_BASE16_IN1)
+#define MGF_KEYS_BASE16_IN1_TIGER       ((((ARCH_WORD_64)MGF__Tiger     )<<56)|MGF_KEYS_BASE16_IN1)
 #define MGF_KEYS_BASE16_IN1_RIPEMD128   ((((ARCH_WORD_64)MGF__RIPEMD128 )<<56)|MGF_KEYS_BASE16_IN1)
 #define MGF_KEYS_BASE16_IN1_RIPEMD160   ((((ARCH_WORD_64)MGF__RIPEMD160 )<<56)|MGF_KEYS_BASE16_IN1)
 #define MGF_KEYS_BASE16_IN1_RIPEMD256   ((((ARCH_WORD_64)MGF__RIPEMD256 )<<56)|MGF_KEYS_BASE16_IN1)
@@ -214,6 +231,14 @@ typedef struct DYNAMIC_Constants_t
 #define MGF_KEYS_BASE16_IN1_SKEIN256    ((((ARCH_WORD_64)MGF__SKEIN256  )<<56)|MGF_KEYS_BASE16_IN1)
 #define MGF_KEYS_BASE16_IN1_SKEIN384    ((((ARCH_WORD_64)MGF__SKEIN384  )<<56)|MGF_KEYS_BASE16_IN1)
 #define MGF_KEYS_BASE16_IN1_SKEIN512    ((((ARCH_WORD_64)MGF__SKEIN512  )<<56)|MGF_KEYS_BASE16_IN1)
+#define MGF_KEYS_BASE16_IN1_SHA3_224    ((((ARCH_WORD_64)MGF__SHA3_224  )<<56)|MGF_KEYS_BASE16_IN1)
+#define MGF_KEYS_BASE16_IN1_SHA3_256    ((((ARCH_WORD_64)MGF__SHA3_256  )<<56)|MGF_KEYS_BASE16_IN1)
+#define MGF_KEYS_BASE16_IN1_SHA3_384    ((((ARCH_WORD_64)MGF__SHA3_384  )<<56)|MGF_KEYS_BASE16_IN1)
+#define MGF_KEYS_BASE16_IN1_SHA3_512    ((((ARCH_WORD_64)MGF__SHA3_512  )<<56)|MGF_KEYS_BASE16_IN1)
+#define MGF_KEYS_BASE16_IN1_KECCAK_256  ((((ARCH_WORD_64)MGF__KECCAK_256)<<56)|MGF_KEYS_BASE16_IN1)
+#define MGF_KEYS_BASE16_IN1_KECCAK_512  ((((ARCH_WORD_64)MGF__KECCAK_512)<<56)|MGF_KEYS_BASE16_IN1)
+// LARGE_HASH_EDIT_POINT
+
 #define MGF_KEYS_BASE16_IN1_Offset32         0x00000008   // deprecated (use the _MD5 version)
 #define MGF_KEYS_BASE16_IN1_Offset_MD5        ((((ARCH_WORD_64)MGF__MD5       )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
 #define MGF_KEYS_BASE16_IN1_Offset_MD4        ((((ARCH_WORD_64)MGF__MD4       )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
@@ -225,6 +250,7 @@ typedef struct DYNAMIC_Constants_t
 #define MGF_KEYS_BASE16_IN1_Offset_GOST       ((((ARCH_WORD_64)MGF__GOST      )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
 #define MGF_KEYS_BASE16_IN1_Offset_WHIRLPOOL  ((((ARCH_WORD_64)MGF__WHIRLPOOL )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
 #define MGF_KEYS_BASE16_IN1_Offset_Tiger      ((((ARCH_WORD_64)MGF__Tiger     )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
+#define MGF_KEYS_BASE16_IN1_Offset_TIGER      ((((ARCH_WORD_64)MGF__Tiger     )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
 #define MGF_KEYS_BASE16_IN1_Offset_RIPEMD128  ((((ARCH_WORD_64)MGF__RIPEMD128 )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
 #define MGF_KEYS_BASE16_IN1_Offset_RIPEMD160  ((((ARCH_WORD_64)MGF__RIPEMD160 )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
 #define MGF_KEYS_BASE16_IN1_Offset_RIPEMD256  ((((ARCH_WORD_64)MGF__RIPEMD256 )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
@@ -250,16 +276,21 @@ typedef struct DYNAMIC_Constants_t
 #define MGF_KEYS_BASE16_IN1_Offset_SKEIN256   ((((ARCH_WORD_64)MGF__SKEIN256  )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
 #define MGF_KEYS_BASE16_IN1_Offset_SKEIN384   ((((ARCH_WORD_64)MGF__SKEIN384  )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
 #define MGF_KEYS_BASE16_IN1_Offset_SKEIN512   ((((ARCH_WORD_64)MGF__SKEIN512  )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
+#define MGF_KEYS_BASE16_IN1_Offset_SHA3_224   ((((ARCH_WORD_64)MGF__SHA3_224  )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
+#define MGF_KEYS_BASE16_IN1_Offset_SHA3_256   ((((ARCH_WORD_64)MGF__SHA3_256  )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
+#define MGF_KEYS_BASE16_IN1_Offset_SHA3_384   ((((ARCH_WORD_64)MGF__SHA3_384  )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
+#define MGF_KEYS_BASE16_IN1_Offset_SHA3_512   ((((ARCH_WORD_64)MGF__SHA3_512  )<<56)|MGF_KEYS_BASE16_IN1_Offset32)
+#define MGF_KEYS_BASE16_IN1_Offset_KECCAK_256 ((((ARCH_WORD_64)MGF__KECCAK_256)<<56)|MGF_KEYS_BASE16_IN1_Offset32)
+#define MGF_KEYS_BASE16_IN1_Offset_KECCAK_512 ((((ARCH_WORD_64)MGF__KECCAK_512)<<56)|MGF_KEYS_BASE16_IN1_Offset32)
+// LARGE_HASH_EDIT_POINT
 
 //#define MGF_KEYS_BASE16_X86_IN1          0x00000010
 //  Open                                   0x00000010
 //#define MGF_KEYS_BASE16_X86_IN1_Offset32 0x00000020
 //  Open                                   0x00000020
 
-#define MGF_PHPassSetup                  0x00000040
 #define MGF_POSetup                      0x00000080
 #define MGF_POOR_OMP                     0x00000100
-#define MGF_FreeBSDMD5Setup              0x00000000
 //#define MGF_RAW_SHA1_INPUT             0x00000200 // no longer 'used'
 #define MGF_RAW_SHA1_INPUT               0x00000000
 // open                                  0x00000200
@@ -308,7 +339,7 @@ typedef struct DYNAMIC_Setup_t
 extern int dynamic_allow_rawhash_fixup;
 
 int dynamic_SETUP(DYNAMIC_Setup *, struct fmt_main *pFmt);
-int dynamic_IS_VALID(int i, int force);
+int dynamic_IS_VALID(int i, int single_lookup_only);
 int dynamic_real_salt_length(struct fmt_main *pFmt);
 void dynamic_DISPLAY_ALL_FORMATS();
 char *RemoveHEX(char *output, char *input);
@@ -323,7 +354,7 @@ struct fmt_main * dynamic_Register_local_format(int *);
 
 int dynamic_RESERVED_PRELOAD_SETUP(int cnt, struct fmt_main *pFmt);
 char *dynamic_PRELOAD_SIGNATURE(int cnt);
-int dynamic_IS_PARSER_VALID(int which);
+int dynamic_IS_PARSER_VALID(int which, int single_lookup_only);
 
 // This one is called in the .pot writing.  We 'fixup' salts which contain ':' chars, or other
 // chars which cause problems (like the $ char).
@@ -361,13 +392,16 @@ extern void DynamicFunc__append_salt(DYNA_OMP_PARAMS);
 extern void DynamicFunc__set_input_len_16(DYNA_OMP_PARAMS);
 extern void DynamicFunc__set_input_len_20(DYNA_OMP_PARAMS);
 extern void DynamicFunc__set_input_len_32(DYNA_OMP_PARAMS);
+extern void DynamicFunc__set_input_len_32_cleartop(DYNA_OMP_PARAMS);
 extern void DynamicFunc__set_input_len_40(DYNA_OMP_PARAMS);
 extern void DynamicFunc__set_input_len_64(DYNA_OMP_PARAMS);
 extern void DynamicFunc__set_input_len_100(DYNA_OMP_PARAMS);
 extern void DynamicFunc__set_input2_len_16(DYNA_OMP_PARAMS);
 extern void DynamicFunc__set_input2_len_20(DYNA_OMP_PARAMS);
+extern void DynamicFunc__set_input2_len_32_cleartop(DYNA_OMP_PARAMS); // needed on BE systems for mdx(mdx(mdx($p))) type functions.
 extern void DynamicFunc__set_input2_len_32(DYNA_OMP_PARAMS);
 extern void DynamicFunc__set_input2_len_40(DYNA_OMP_PARAMS);
+extern void DynamicFunc__set_input2_len_40_cleartop(DYNA_OMP_PARAMS); // needed on BE systems for sha1(sha1(sha1($p))) type functions.
 extern void DynamicFunc__set_input2_len_64(DYNA_OMP_PARAMS);
 
 extern void DynamicFunc__set_input_len_24(DYNA_OMP_PARAMS);
@@ -499,7 +533,8 @@ extern void DynamicFunc__base16_convert_upcase(DYNA_OMP_PARAMS);
 
 extern void DynamicFunc__LargeHash_OUTMode_base16(DYNA_OMP_PARAMS);
 extern void DynamicFunc__LargeHash_OUTMode_base16u(DYNA_OMP_PARAMS);
-extern void DynamicFunc__LargeHash_OUTMode_base64(DYNA_OMP_PARAMS);
+extern void DynamicFunc__LargeHash_OUTMode_base64(DYNA_OMP_PARAMS);	// mime
+extern void DynamicFunc__LargeHash_OUTMode_base64c(DYNA_OMP_PARAMS);	// crypt
 extern void DynamicFunc__LargeHash_OUTMode_base64_nte(DYNA_OMP_PARAMS); // no trailing = chars, for non length%3 !=0
 extern void DynamicFunc__LargeHash_OUTMode_raw(DYNA_OMP_PARAMS);
 
@@ -510,6 +545,14 @@ extern void DynamicFunc__LargeHash_OUTMode_raw(DYNA_OMP_PARAMS);
 	extern void DynamicFunc__##HASH##_crypt_input2_overwrite_input2(DYNA_OMP_PARAMS); \
 	extern void DynamicFunc__##HASH##_crypt_input1_overwrite_input2(DYNA_OMP_PARAMS); \
 	extern void DynamicFunc__##HASH##_crypt_input2_overwrite_input1(DYNA_OMP_PARAMS); \
+	extern void DynamicFunc__##HASH##_crypt_input1_to_output1(DYNA_OMP_PARAMS); \
+	extern void DynamicFunc__##HASH##_crypt_input1_to_output2(DYNA_OMP_PARAMS); \
+	extern void DynamicFunc__##HASH##_crypt_input1_to_output3(DYNA_OMP_PARAMS); \
+	extern void DynamicFunc__##HASH##_crypt_input1_to_output4(DYNA_OMP_PARAMS); \
+	extern void DynamicFunc__##HASH##_crypt_input2_to_output1(DYNA_OMP_PARAMS); \
+	extern void DynamicFunc__##HASH##_crypt_input2_to_output2(DYNA_OMP_PARAMS); \
+	extern void DynamicFunc__##HASH##_crypt_input2_to_output3(DYNA_OMP_PARAMS); \
+	extern void DynamicFunc__##HASH##_crypt_input2_to_output4(DYNA_OMP_PARAMS); \
 	extern void DynamicFunc__##HASH##_crypt_input1_to_output1_FINAL(DYNA_OMP_PARAMS); \
 	extern void DynamicFunc__##HASH##_crypt_input2_to_output1_FINAL(DYNA_OMP_PARAMS)
 
@@ -548,9 +591,15 @@ LARGE_HASH_FUNCTION_DECLARAION(SKEIN224);
 LARGE_HASH_FUNCTION_DECLARAION(SKEIN256);
 LARGE_HASH_FUNCTION_DECLARAION(SKEIN384);
 LARGE_HASH_FUNCTION_DECLARAION(SKEIN512);
+LARGE_HASH_FUNCTION_DECLARAION(SHA3_224);
+LARGE_HASH_FUNCTION_DECLARAION(SHA3_256);
+LARGE_HASH_FUNCTION_DECLARAION(SHA3_384);
+LARGE_HASH_FUNCTION_DECLARAION(SHA3_512);
+LARGE_HASH_FUNCTION_DECLARAION(KECCAK_256);
+LARGE_HASH_FUNCTION_DECLARAION(KECCAK_512);
+// LARGE_HASH_EDIT_POINT
 
-// These 3 dump the raw crypt back into input (only at the head of it).
-// they are for phpass, wordpress, etc.
+// These dump the raw crypt back into input (only at the head of it).
 extern void DynamicFunc__crypt_md5_to_input_raw(DYNA_OMP_PARAMS);
 extern void DynamicFunc__crypt_md5_to_input_raw_Overwrite_NoLen(DYNA_OMP_PARAMS);
 // NOTE, the below line is called 'one' time.  It calls the 'normal' intrinsic loading
@@ -561,18 +610,13 @@ extern void DynamicFunc__crypt_md5_to_input_raw_Overwrite_NoLen(DYNA_OMP_PARAMS)
 // us a 1 or 2% speed increase.
 extern void DynamicFunc__crypt_md5_to_input_raw_Overwrite_NoLen_but_setlen_in_SSE(DYNA_OMP_PARAMS);
 
-// special for phpass
-extern void DynamicFunc__PHPassCrypt(DYNA_OMP_PARAMS);
 // special for PO
 extern void DynamicFunc__POCrypt(DYNA_OMP_PARAMS);
-// special for OpenBSD MD5 and Apache MD5
-extern void DynamicFunc__FreeBSDMD5Crypt(DYNA_OMP_PARAMS);
 
 // End of generic md5 'types' and helpers
 
 // Depricated 'functions'  These are now 'flags'. We handle them by 'adding' the proper flags, but allow the script
 // to run IF the user has these fake functions as the first function.
-extern void DynamicFunc__PHPassSetup(DYNA_OMP_PARAMS);
 extern void DynamicFunc__InitialLoadKeysToInput(DYNA_OMP_PARAMS);
 extern void DynamicFunc__InitialLoadKeys_md5crypt_ToOutput2(DYNA_OMP_PARAMS);
 extern void DynamicFunc__InitialLoadKeys_md5crypt_ToOutput2_Base16_to_Input1(DYNA_OMP_PARAMS);

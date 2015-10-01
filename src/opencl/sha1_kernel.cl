@@ -35,13 +35,17 @@
 #ifdef USE_BITSELECT
 #define F1(x, y, z)	bitselect(z, y, x)
 #else
-#define F1(x, y, z)	(z ^ (x & (y ^ z)))
+#if HAVE_ANDNOT
+#define F1(x, y, z) ((x & y) ^ ((~x) & z))
+#else
+#define F1(x, y, z) (z ^ (x & (y ^ z)))
+#endif
 #endif
 
 #define F2(x, y, z)		(x ^ y ^ z)
 
 #ifdef USE_BITSELECT
-#define F3(x, y, z)	(bitselect(x, y, z) ^ bitselect(x, 0U, y))
+#define F3(x, y, z)	bitselect(x, y, (z) ^ (x))
 #else
 #define F3(x, y, z)	((x & y) | (z & (x | y)))
 #endif
@@ -355,7 +359,7 @@ __kernel void sha1(__global uint *keys,
 		  __global
 #endif
 		  uint *int_keys
-#if USE_CONST_CACHE && gpu_amd(DEVICE_INFO)
+#if !defined(__OS_X__) && USE_CONST_CACHE && gpu_amd(DEVICE_INFO)
 		__attribute__((max_constant_size (NUM_INT_KEYS * 4)))
 #endif
 		 , __global uint *bitmaps,
@@ -366,8 +370,6 @@ __kernel void sha1(__global uint *keys,
 		  volatile __global uint *bitmap_dupe)
 {
 	uint i;
-	uint lid = get_local_id(0);
-	uint lws = get_local_size(0);
 	uint gid = get_global_id(0);
 	uint base = index[gid];
 	uint W[16] = { 0 };
@@ -409,6 +411,8 @@ __kernel void sha1(__global uint *keys,
 #endif
 
 #if USE_LOCAL_BITMAPS
+	uint lid = get_local_id(0);
+	uint lws = get_local_size(0);
 	uint __local s_bitmaps[(BITMAP_SIZE_BITS >> 5) * SELECT_CMP_STEPS];
 
 	for(i = 0; i < (((BITMAP_SIZE_BITS >> 5) * SELECT_CMP_STEPS) / lws); i++)

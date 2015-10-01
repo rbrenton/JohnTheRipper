@@ -18,9 +18,7 @@
  *
  */
 
-#if AC_BUILT
-#include "autoconfig.h"
-#endif
+#include "arch.h"
 #ifndef DYNAMIC_DISABLED
 
 #if FMT_EXTERNS_H
@@ -36,6 +34,7 @@ john_register_one(&fmt_CompiledDynamic);
 #include "dynamic.h"
 #include "dynamic_compiler.h"
 #include "dynamic_types.h"
+#include "options.h"
 #include "memdbg.h"
 
 #define FORMAT_LABEL		"dynamic="
@@ -51,15 +50,18 @@ john_register_one(&fmt_CompiledDynamic);
 
 extern const char *dyna_script;
 extern const char *dyna_signature;
-extern const char *dyna_line1;
-extern const char *dyna_line2;
-extern const char *dyna_line3;
 extern int dyna_sig_len;
 
-static struct fmt_tests tests[] = {
+static struct fmt_tests tests[DC_NUM_VECTORS + 1] = {
 	{"@dynamic=md5($p)@900150983cd24fb0d6963f7d28e17f72", "abc"},
 	{"@dynamic=md5($p)@527bd5b5d689e2c32ae974c6229ff785", "john"},
 	{"@dynamic=md5($p)@9dc1dc3f8499ab3bbc744557acf0a7fb", "passweird"},
+#if SIMD_COEF_32 < 4
+	{"@dynamic=md5($p)@fc58a609d0358176385b00970bfb2b49", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzABCDEF"},
+#else
+	{"@dynamic=md5($p)@142a42ffcb282cf8087dd4dfebacdec2", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzABC"},
+#endif
+	{"@dynamic=md5($p)@d41d8cd98f00b204e9800998ecf8427e", ""},
 	{NULL},
 };
 
@@ -101,8 +103,14 @@ static char *our_split(char *ciphertext, int index, struct fmt_main *self)
 }
 static char *our_prepare(char **fields, struct fmt_main *self)
 {
-	char *ciphertext = dynamic_compile_prepare(fields[0], fields[1]);
-	return ciphertext;
+	if (options.format && !strncmp(options.format, "dynamic=", 8)) {
+		extern const char *options_format;
+		char *ct;
+		options_format = options.format;
+		ct = dynamic_compile_prepare(fields[0], fields[1]);
+		return ct;
+	}
+	return fields[1];
 }
 
 static int our_valid(char *ciphertext, struct fmt_main *self)
@@ -140,10 +148,9 @@ struct fmt_main fmt_CompiledDynamic =
 		// setup the labeling and stuff. NOTE the max and min crypts are set to 1
 		// here, but will be reset within our init() function.
 		FORMAT_LABEL, FORMAT_NAME, ALGORITHM_NAME, BENCHMARK_COMMENT, BENCHMARK_LENGTH,
-		0, 0, 16, BINARY_ALIGN, DYNA_SALT_SIZE, SALT_ALIGN, 1, 1, FMT_CASE | FMT_8_BIT | FMT_DYNAMIC,
-#if FMT_MAIN_VERSION > 11
+			/* for now, turn off FMT_SPLIT_UNIFIES_CASE until we get the code right */
+		0, 0, 16, BINARY_ALIGN, DYNA_SALT_SIZE, SALT_ALIGN, 1, 1, FMT_CASE | FMT_8_BIT | FMT_DYNAMIC /*| FMT_SPLIT_UNIFIES_CASE */ ,
 		{ NULL },
-#endif
 		tests
 	},
 	{
@@ -159,12 +166,20 @@ struct fmt_main fmt_CompiledDynamic =
 };
 
 static void link_funcs() {
+	static char max_vector[PLAINTEXT_BUFFER_SIZE];
 	char *cp;
 	private_subformat_data *pPriv = fmt_CompiledDynamic.private.data;
+	int i;
+
 	cp = strrchr(fmt_CompiledDynamic.params.algorithm_name, ')');
 	if (cp) {
 		fmt_CompiledDynamic.params.label = fmt_CompiledDynamic.params.algorithm_name;
 		++cp;
+		if (*cp == '^')
+		{
+			while (*cp != ' ')
+				++cp;
+		}
 		*cp++ = 0;
 		if (*cp  == ' ') ++cp;
 		fmt_CompiledDynamic.params.algorithm_name = cp;
@@ -174,18 +189,42 @@ static void link_funcs() {
 	fmt_CompiledDynamic.methods.split = our_split;
 	fmt_CompiledDynamic.methods.prepare = our_prepare;
 	fmt_CompiledDynamic.methods.done = our_done;
-	fmt_CompiledDynamic.params.tests[0].ciphertext = (char*)dyna_line1;
-	fmt_CompiledDynamic.params.tests[1].ciphertext = (char*)dyna_line2;
-	fmt_CompiledDynamic.params.tests[2].ciphertext = (char*)dyna_line3;
-	if ((pPriv->pSetup->flags&MGF_PASSWORD_UPCASE)==MGF_PASSWORD_UPCASE) {
+
+	for (i = 0; i < DC_NUM_VECTORS; i++)
+		fmt_CompiledDynamic.params.tests[i].ciphertext = (char*)dyna_line[i];
+
+	/* for now, turn off FMT_SPLIT_UNIFIES_CASE until we get the code right */
+	fmt_CompiledDynamic.params.flags &= ~FMT_SPLIT_UNIFIES_CASE;
+
+	if ((pPriv->pSetup->flags&MGF_SALTED)!=MGF_SALTED)
+		fmt_CompiledDynamic.params.benchmark_length = -1;
+	else
+		fmt_CompiledDynamic.params.benchmark_length = 0;
+
+	if (pPriv->pSetup->flags&MGF_PASSWORD_UPCASE) {
 		tests[0].plaintext = "ABC";
 		tests[1].plaintext = "JOHN";
 		tests[2].plaintext= "PASSWEIRD";
+		for (i = 0; i < pPriv->pSetup->MaxInputLen; i++)
+			max_vector[i] = 'A' + (i % 26);
+		max_vector[i] = 0;
+	} else if (pPriv->pSetup->flags&MGF_PASSWORD_LOCASE) {
+		tests[0].plaintext = "abc";
+		tests[1].plaintext = "john";
+		tests[2].plaintext= "passweird";
+		for (i = 0; i < fmt_CompiledDynamic.params.plaintext_length; i++)
+			max_vector[i] = 'a' + (i % 26);
+		max_vector[i] = 0;
 	} else {
 		tests[0].plaintext = "abc";
 		tests[1].plaintext = "john";
 		tests[2].plaintext= "passweird";
+		for (i = 0; i < fmt_CompiledDynamic.params.plaintext_length; i++)
+			max_vector[i] = 'A' + (i % 26) + ((i % 52) > 25 ? 0x20 : 0);
+		max_vector[i] = 0;
 	}
+	tests[3].plaintext = max_vector;
+	tests[4].plaintext = "";
 }
 
 static void our_init(struct fmt_main *self)
@@ -202,7 +241,7 @@ static void get_ptr() {
 		dynamic_LOCAL_FMT_FROM_PARSER_FUNCTIONS(dyna_script, &dyna_type, &fmt_CompiledDynamic, Convert);
 		sprintf (dyna_hash_type, "$dynamic_%d$", dyna_type);
 		dyna_hash_type_len = strlen(dyna_hash_type);
-		pDynamic = dynamic_THIN_FORMAT_LINK(&fmt_CompiledDynamic, Convert(Conv_Buf, (char*)dyna_line1, 0), "@dynamic=", 0);
+		pDynamic = dynamic_THIN_FORMAT_LINK(&fmt_CompiledDynamic, Convert(Conv_Buf, (char*)dyna_line[0], 0), "@dynamic=", 0);
 		link_funcs();
 	}
 }
